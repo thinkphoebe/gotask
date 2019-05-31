@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
-	log "github.com/thinkphoebe/golog"
 	"github.com/thinkphoebe/goetcd"
+	log "github.com/thinkphoebe/golog"
 )
 
 type _TaskInfo struct {
@@ -25,7 +25,7 @@ type _TaskInfo struct {
 }
 
 type TaskWorker struct {
-	config WorkerConfig
+	config TaskWorkerConfig
 
 	etcd     goetcd.Etcd
 	chTask   chan *_TaskInfo
@@ -39,12 +39,12 @@ type TaskWorker struct {
 }
 
 func (self *TaskWorker) itemKey(taskId, item string) string {
-	return self.config.Etcd.KeyPrefix + "/" + item + "/" + taskId
+	return *self.config.Etcd.KeyPrefix + "/" + item + "/" + taskId
 }
 
 func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	// 尝试创建任务的key Owner，如果创建成功则认为获取到任务
-	resp, err := self.etcd.Client.Grant(context.TODO(), self.config.TaskOwnTime)
+	resp, err := self.etcd.Client.Grant(context.TODO(), *self.config.TaskOwnTime)
 	if err != nil {
 		log.Errorf("[%s] etcd.Client.Grant got error:%s, TaskOwnTime:%d", task.param.TaskId, err.Error(),
 			self.config.TaskOwnTime)
@@ -55,7 +55,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	cmpParam := clientv3.Compare(clientv3.CreateRevision(keyParam), "!=", 0)
 	keyOwner := self.itemKey(task.param.TaskId, "Owner")
 	cmpOwner := self.etcd.CmpKeyNotExist(keyOwner)
-	opOwner := clientv3.OpPut(keyOwner, fmt.Sprintf(`{"instance": "%s"}`, self.config.GInstanceId), opts...)
+	opOwner := clientv3.OpPut(keyOwner, fmt.Sprintf(`{"instance": "%s"}`, self.config.instanceId), opts...)
 	opFetch := clientv3.OpDelete(self.itemKey(task.param.TaskId, "Fetch/"+task.param.TaskType))
 	cmps := []clientv3.Cmp{cmpParam, cmpOwner} // task_param存在，owner不存在
 	ifs := []clientv3.Op{opOwner, opFetch}
@@ -69,7 +69,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 		return false
 	}
 	log.Infof("[%s] take task owner succeed, config [%#v]", task.param.TaskId, task.param)
-	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId,
+	self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId,
 		"task_type": task.param.TaskType, "user_param": task.param.UserParam})
 
 	// 如果已有Status key则读取
@@ -87,23 +87,23 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 
 	// 启动任务
 	task.status.StartTime = time.Now().Unix()
-	err = self.config.CbTaskStart(&task.param)
+	err = self.config.cbTaskStart(&task.param)
 	if err == nil {
 		self.updateStatusValue(task, TaskStatusInit, "")
-		log.Debugf("CbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
+		log.Debugf("cbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
 	} else {
 		self.updateStatusValue(task, "error", "")
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
-			"reason": "CbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
+		self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+			"reason": "cbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
 		self.etcd.Del(keyOwner, false)
 		return false
 	}
 
 	// 起一个goroutine监控任务的Owner key，被删掉时停止任务
 	on_delete := func(key string, val []byte) bool {
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+		self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 			"reason": "owner key deleted", "status": fmt.Sprintf("%#v", task.status)})
-		self.config.CbTaskStop(&task.param)
+		self.config.cbTaskStop(&task.param)
 		self.chRemove <- task
 		return true
 	}
@@ -126,8 +126,8 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 
 	log.Infof("[%s] task remove, remove from queue", task.param.TaskId)
 	go func(task *_TaskInfo) {
-		log.Debugf("[%s] task remove, call CbTaskStop", task.param.TaskId)
-		self.config.CbTaskStop(&task.param)
+		log.Debugf("[%s] task remove, call cbTaskStop", task.param.TaskId)
+		self.config.cbTaskStop(&task.param)
 		log.Debugf("[%s] task remove, call cancelOwnerWatch", task.param.TaskId)
 		task.cancelOwnerWatch()
 		log.Debugf("[%s] task remove, Del owner", task.param.TaskId)
@@ -143,24 +143,24 @@ func (self *TaskWorker) checkNewTasks() {
 			t := task
 			task = task.Next()
 			taskInfo := t.Value.(*_TaskInfo)
-			if time.Now().Unix()-taskInfo.foundTime > self.config.MaxQueueTime {
+			if time.Now().Unix()-taskInfo.foundTime > *self.config.MaxQueueTime {
 				log.Debugf("[%s][%s] remove timeout from queue", taskInfo.param.TaskId, taskType)
 				queue.Remove(t)
 			} else {
-				err := self.config.CbTaskAddCheck(&taskInfo.param)
+				err := self.config.cbTaskAddCheck(&taskInfo.param)
 				if err == nil {
 					log.Debugf("[%s][%s] try take owner", taskInfo.param.TaskId, taskType)
 					if self.tryAddTask(taskInfo) {
 						self.taskProcessing[taskInfo.param.TaskId] = taskInfo
 					}
 				} else if err == ErrNotSupport {
-					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
+					log.Debugf("[%s][%s] cbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
 					queue.Remove(t)
 				} else if err == ErrOutOfResource {
-					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], pause check", taskInfo.param.TaskId, taskType, err.Error())
+					log.Debugf("[%s][%s] cbTaskAddCheck ret [%s], pause check", taskInfo.param.TaskId, taskType, err.Error())
 					break
 				} else {
-					log.Criticalf("CbTaskAddCheck invalid return value [%v], client code error", err)
+					log.Criticalf("cbTaskAddCheck invalid return value [%v], client code error", err)
 				}
 			}
 		}
@@ -214,8 +214,8 @@ func (self *TaskWorker) watchNewTask() {
 	visitor := FetchVisitor{}
 	visitor.caller = "watchNewTask"
 	visitor.chTask = self.chTask
-	for _, taskType := range self.config.TaskTypes {
-		go self.etcd.WatchVisitor(self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, "PUT", true, &visitor, nil)
+	for _, taskType := range *self.config.TaskTypes {
+		go self.etcd.WatchVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, "PUT", true, &visitor, nil)
 	}
 }
 
@@ -225,14 +225,14 @@ func (self *TaskWorker) scanExistingTasks() {
 	visitor.chTask = self.chTask
 	visitor.opts = []clientv3.OpOption{}
 	visitor.opts = append(visitor.opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend))
-	for _, taskType := range self.config.TaskTypes {
-		go self.etcd.WalkVisitor(self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, &visitor, -1, nil)
+	for _, taskType := range *self.config.TaskTypes {
+		go self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, &visitor, -1, nil)
 	}
 }
 
-func (self *TaskWorker) Init(config *WorkerConfig) error {
+func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 	self.config = *config
-	err := self.etcd.Init(config.Etcd.Endpoints, config.Etcd.DialTimeout)
+	err := self.etcd.Init(*config.Etcd.Endpoints, *config.Etcd.DialTimeout)
 	if err != nil {
 		log.Criticalf("etcd.Init got err [%s], Endpoints [%#v], DialTimeout [%d]",
 			err.Error(), config.Etcd.Endpoints, config.Etcd.DialTimeout)
@@ -243,7 +243,7 @@ func (self *TaskWorker) Init(config *WorkerConfig) error {
 	self.chRemove = make(chan *_TaskInfo, 1000)
 
 	self.taskQueue = make(map[string]*list.List)
-	for _, taskType := range self.config.TaskTypes {
+	for _, taskType := range *self.config.TaskTypes {
 		self.taskQueue[taskType] = list.New()
 	}
 	self.taskProcessing = make(map[string]*_TaskInfo)
@@ -283,7 +283,7 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status, userParam str
 	if status == TaskStatusWorking {
 		resp, err := self.etcd.Client.KeepAliveOnce(context.TODO(), taskInfo.leaseId)
 		if err != nil {
-			self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
+			self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
 				"reason": "keepalive got error:" + err.Error(), "status": fmt.Sprintf("%#v", taskInfo.status)})
 			self.chRemove <- taskInfo
 		} else {
@@ -291,7 +291,7 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status, userParam str
 			taskInfo.rentTime = time.Now().Unix()
 		}
 	} else if status == TaskStatusComplete || status == TaskStatusError {
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
+		self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo
 	}
