@@ -450,7 +450,7 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	}
 
 	var delInfo DeletedInfo
-	delInfo.TaskParam = string(paramBytes)
+	delInfo.TaskParam = paramBytes
 	delInfo.TaskStatus = string(statusBytes)
 	delInfo.DeleteTime = time.Now().Unix()
 	delBytes, _ := json.Marshal(delInfo)
@@ -600,7 +600,7 @@ func (self *TaskManager) Start() {
 	}
 }
 
-func (self *TaskManager) Add(userId, taskType, userParam string, retryCount int) (taskId string, err error) {
+func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCount int) (taskId string, err error) {
 	var taskParam TaskParam
 	taskParam.TaskId = genTaskId()
 	taskParam.TaskType = taskType

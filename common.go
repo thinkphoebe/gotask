@@ -67,14 +67,14 @@ type TaskParam struct {
 	TaskType  string `json:"taskType,omitempty"`
 	UserId    string `json:"userId,omitempty"`
 	Retry     int    `json:"retry,omitempty"` // 0：不重试，+n：重试次数，-1：无限重试
-	UserParam string `json:"userParam,omitempty"`
+	UserParam []byte `json:"userParam,omitempty"`
 }
 
 type TaskStatus struct {
 	Status     string `json:"status,omitempty"`
 	StartTime  int64  `json:"startTime,omitempty"`
 	UpdateTime int64  `json:"updateTime,omitempty"`
-	UserParam  string `json:"userParam,omitempty"`
+	UserParam  []byte `json:"userParam,omitempty"`
 }
 
 type ErrorInfo struct {
@@ -83,7 +83,7 @@ type ErrorInfo struct {
 
 type DeletedInfo struct {
 	DeleteTime int64  `json:"deleteTime,omitempty"`
-	TaskParam  string `json:"taskParam,omitempty"`
+	TaskParam  []byte `json:"taskParam,omitempty"`
 	TaskStatus string `json:"taskStatus,omitempty"`
 }
 

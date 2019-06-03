@@ -89,10 +89,10 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	task.status.StartTime = time.Now().Unix()
 	err = self.config.cbTaskStart(&task.param)
 	if err == nil {
-		self.updateStatusValue(task, TaskStatusInit, "")
+		self.updateStatusValue(task, TaskStatusInit, []byte(""))
 		log.Debugf("cbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
 	} else {
-		self.updateStatusValue(task, "error", "")
+		self.updateStatusValue(task, "error", []byte(""))
 		self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 			"reason": "cbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
 		self.etcd.Del(keyOwner, false)
@@ -167,7 +167,7 @@ func (self *TaskWorker) checkNewTasks() {
 	}
 }
 
-func (self *TaskWorker) updateStatusValue(task *_TaskInfo, status string, userParam string) {
+func (self *TaskWorker) updateStatusValue(task *_TaskInfo, status string, userParam []byte) {
 	task.status.Status = status
 	task.status.UserParam = userParam
 	task.status.UpdateTime = time.Now().Unix()
@@ -272,7 +272,7 @@ func (self *TaskWorker) Start() {
 	log.Infof("Start OK")
 }
 
-func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status, userParam string) {
+func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userParam []byte) {
 	taskInfo, ok := self.taskProcessing[param.TaskId]
 	if !ok {
 		log.Warnf("[%s] task not found", param.TaskId)
