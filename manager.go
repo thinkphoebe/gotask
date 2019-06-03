@@ -125,7 +125,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 			key := self.itemKey(taskId, "Wait")
 			val := logId
 			if err := self.etcd.Put(key, val, waitTime); err != nil {
-				self.config.cbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
+				self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
 					"value": logId, "ttl": waitTime})
 			}
 		} else {
@@ -147,7 +147,7 @@ func (self *TaskManager) onKeyFetchDelete(key string, val []byte) bool {
 	}
 	if self.readEtcdJson(taskId, self.itemKey(taskId, "Owner"), nil, nil) != nil {
 		log.Infof("[%s] no owner, recover task", taskId)
-		self.config.cbLogJson(log.LevelWarn, log.Json{"cmd": "fetch_timeout", "task_id": taskId, "task_type": taskParam.TaskType})
+		self.config.CbLogJson(log.LevelWarn, log.Json{"cmd": "fetch_timeout", "task_id": taskId, "task_type": taskParam.TaskType})
 		self.recoverTask(taskId, "recover_fetch", false)
 	}
 	return true
@@ -254,14 +254,14 @@ func (self *TaskManager) updateFetch() {
 		opQueue := self.etcd.OpDel(self.itemKey(taskId, "Queue/"+taskParam.TaskType+"/"+taskParam.UserId), false)
 		opFetch, err := self.etcd.OpPut(self.itemKey(taskId, "Fetch/"+taskParam.TaskType), string(paramBytes), *self.config.FetchTimeout)
 		if err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
 				"ttl": self.config.FetchTimeout, "error": "moveTask self.etcd.OpPut got err:" + err.Error()})
 			return
 		}
 		ifs := []clientv3.Op{*opProc, *opQueue, *opFetch}
 		resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, nil)
 		if err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 				"error": "moveTask self.etcd.Txn got err:" + err.Error()})
 			return
 		}
@@ -367,7 +367,7 @@ func (self *TaskManager) updateFetch() {
 					haveError := false
 					for taskType := range self.taskTypesMap {
 						count, err := self.etcd.Count(*self.config.Etcd.KeyPrefix + "/Queue/" + taskType + "/" + userId)
-						self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "user_queue", "user_id": userId,
+						self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "user_queue", "user_id": userId,
 							"queue_size": count, "taskType": taskType, "update": time.Now().Unix() - update})
 						if err != nil {
 							haveError = true
@@ -415,7 +415,7 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 		log.Infof("[%s] update ErrorInfo to:%v", taskId, string(errorBytes))
 		key := self.itemKey(taskId, "ErrorInfo")
 		if err := self.etcd.Put(key, string(errorBytes), 0); err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_write", "task_id": taskId, "key": key,
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_write", "task_id": taskId, "key": key,
 				"value": string(errorBytes), "ttl": 0, "error": err.Error()})
 		}
 	}
@@ -423,13 +423,13 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 	log.Errorf("[%s] recover task", taskId)
 	key := self.itemKey(taskId, "Fetch/"+taskParam.TaskType)
 	if err := self.etcd.Put(key, string(paramBytes), *self.config.FetchTimeout); err != nil {
-		self.config.cbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
+		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
 			"value": string(paramBytes), "ttl": 0})
 	}
 
 	var statesBytes []byte
 	self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), &statesBytes, nil)
-	self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
 		"task_type": taskParam.TaskType, "task_status": string(statesBytes), "error_count": retryCount})
 	return true
 }
@@ -468,12 +468,12 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	ifs := []clientv3.Op{*opDel, *opInfo, *opQueue, *opProc, *opStatus, *opFetch, *opOwner, *opWait, *opErrorInfo}
 	resp, err := self.etcd.Txn(nil, ifs, nil)
 	if err != nil {
-		self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 			"error": "removeTask etcd.Txn got err:" + err.Error()})
 		return errors.New("etcd.Txn got err:" + err.Error())
 	}
 	if !resp.Succeeded {
-		self.config.cbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 			"error": "removeTask etcd.Txn resp not Succeeded, should not go here"})
 		return errors.New("etcd.Txn resp not Succeeded")
 	}
@@ -483,7 +483,7 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	if logId == "delete_error" {
 		param = string(paramBytes)
 	}
-	self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
 		"task_type": taskParam.TaskType, "task_status": taskStatus, "task_param": param})
 	return nil
 }
@@ -503,7 +503,7 @@ func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
 	if err != nil {
 		log.Errorf("parse delInfo FAILED! delete key. key [%s], err [%s]", key, err.Error())
 		if _, err := self.etcd.Del(key, false); err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
 		}
 		return true
 	}
@@ -514,7 +514,7 @@ func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
 
 	log.Infof("key timeout! delete key. [%s] [%v]", key, delInfo.DeleteTime)
 	if _, err := self.etcd.Del(key, false); err != nil {
-		self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
 	}
 	return true
 }
@@ -525,14 +525,14 @@ func (self *TaskManager) statusCleanCallback(key string, val []byte) bool {
 	if err != nil {
 		log.Errorf("parse taskStatus FAILED! delete key. key [%s], err [%s]", key, err.Error())
 		if _, err := self.etcd.Del(key, false); err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
 		}
 		return true
 	}
 	if time.Now().Unix()-taskStatus.UpdateTime > 3600 {
 		log.Infof("found timeout status key! delete key. [%s] [%v]", key, taskStatus.UpdateTime)
 		if _, err := self.etcd.Del(key, false); err != nil {
-			self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
 		}
 	}
 	return true
@@ -618,25 +618,25 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 
 	resp, err := self.etcd.Txn(nil, ifs, nil)
 	if err != nil {
-		self.config.cbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 			"error": "etcd.Txn got err:" + err.Error()})
 		return "", errors.New("etcd.Txn got err:" + err.Error())
 	}
 
 	if !resp.Succeeded {
-		self.config.cbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 			"error": "etcd.Txn resp not Succeeded, should not go here"})
 		return "", errors.New("etcd.Txn resp not Succeeded")
 	}
 
-	self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "task_add", "task_id": taskId, "user_id": userId,
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "task_add", "task_id": taskId, "user_id": userId,
 		"task_type": taskType, "user_param": userParam, "retry": retryCount})
 	return taskId, nil
 }
 
 func (self *TaskManager) Remove(taskId string) error {
 	err := self.removeTask(taskId, "delete_user")
-	self.config.cbLogJson(log.LevelInfo, log.Json{"cmd": "task_remove", "task_id": taskId, "err": err.Error()})
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "task_remove", "task_id": taskId, "err": err.Error()})
 	return err
 }
 
