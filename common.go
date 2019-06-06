@@ -31,10 +31,10 @@ type TaskManagerConfig struct {
 type TaskWorkerConfig struct {
 	Etcd EtcdConfig `json:"etcd"`
 
-	// 监控的任务类型
+	// 监控的任务类型，有匹配TaskTypes的任务添加时会尝试获取执行
 	TaskTypes *[]string `json:"task_types"`
 
-	// 队列中超过MaxQueueTime的任务直接删除，不在尝试获取执行
+	// 队列中超过MaxQueueTime的任务直接删除，不再尝试获取执行
 	MaxQueueTime *int64 `json:"max_queue_time"`
 
 	// 任务租约的时间，client需要按小于TaskOwnTime的间隔调用UpdateTaskStatus函数
@@ -67,6 +67,7 @@ type TaskParam struct {
 	TaskType  string `json:"taskType,omitempty"`
 	UserId    string `json:"userId,omitempty"`
 	Retry     int    `json:"retry,omitempty"` // 0：不重试，+n：重试次数，-1：无限重试
+	AddTime   int64  `json:"add_time,omitempty"` // 任务的添加时间，unix second
 	UserParam []byte `json:"userParam,omitempty"`
 }
 

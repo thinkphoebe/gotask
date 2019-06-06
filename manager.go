@@ -606,6 +606,7 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 	taskParam.TaskType = taskType
 	taskParam.UserId = userId
 	taskParam.Retry = retryCount
+	taskParam.AddTime = time.Now().Unix()
 	taskParam.UserParam = userParam
 	paramBytes, _ := json.Marshal(taskParam)
 
