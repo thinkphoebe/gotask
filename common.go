@@ -25,7 +25,7 @@ type TaskManagerConfig struct {
 	FetchTimeout *int64     `json:"fetch_timeout"`
 
 	// TaskManager有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
-	CbLogJson func(level log.LogLevel, j log.Json)
+	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }
 
 type TaskWorkerConfig struct {
@@ -48,25 +48,25 @@ type TaskWorkerConfig struct {
 	// 返回nil时表示可以添加任务
 	// 返回ErrOutOfResource时表示没有资源，不再继续处理任务列表
 	// 返回其它ErrNotSupport时跳过该任务继续处理任务列表
-	CbTaskAddCheck func(param *TaskParam) error
+	CbTaskAddCheck func(param *TaskParam) error `json:"-"`
 
 	// TaskWorker获取任务成功后调用此回调。用户可在此回调中启动执行任务
 	// 返回nil表示任务添加成功
 	// 返回非nil时将该任务标记为执行失败并Owner，之后manager根据Retry和ErrorCount确定是否重新分发
-	CbTaskStart func(param *TaskParam) error
+	CbTaskStart func(param *TaskParam) error `json:"-"`
 
 	// TaskWorker由于续租失败等原因需要终止任务执行时会调用此回调，用户需要在此回调中停止任务并释放相关的资源
-	CbTaskStop func(param *TaskParam) error
+	CbTaskStop func(param *TaskParam) error `json:"-"`
 
 	// TaskWorker有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
-	CbLogJson func(level log.LogLevel, j log.Json)
+	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }
 
 type TaskParam struct {
 	TaskId    string `json:"taskId,omitempty"`
 	TaskType  string `json:"taskType,omitempty"`
 	UserId    string `json:"userId,omitempty"`
-	Retry     int    `json:"retry,omitempty"` // 0：不重试，+n：重试次数，-1：无限重试
+	Retry     int    `json:"retry,omitempty"`    // 0：不重试，+n：重试次数，-1：无限重试
 	AddTime   int64  `json:"add_time,omitempty"` // 任务的添加时间，unix second
 	UserParam []byte `json:"userParam,omitempty"`
 }
