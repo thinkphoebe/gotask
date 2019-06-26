@@ -68,9 +68,9 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 		log.Infof("[%s] FAILED!", task.param.TaskId)
 		return false
 	}
-	log.Infof("[%s] take task owner succeed, config [%#v]", task.param.TaskId, task.param)
-	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId,
-		"task_type": task.param.TaskType, "user_param": task.param.UserParam})
+	self.taskProcessing[task.param.TaskId] = task
+	log.Infof("[%s] take task owner succeed", task.param.TaskId)
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId, "task_type": task.param.TaskType})
 
 	// 如果已有Status key则读取
 	vals, err := self.etcd.Get(self.itemKey(task.param.TaskId, "Status"), false)
@@ -84,20 +84,8 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	} else {
 		log.Debugf("[%s] no existing status", task.param.TaskId)
 	}
-
-	// 启动任务
 	task.status.StartTime = time.Now().Unix()
-	err = self.config.CbTaskStart(&task.param)
-	if err == nil {
-		self.updateStatusValue(task, TaskStatusInit, []byte(""))
-		log.Debugf("CbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
-	} else {
-		self.updateStatusValue(task, "error", []byte(""))
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
-			"reason": "CbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
-		self.etcd.Del(keyOwner, false)
-		return false
-	}
+	self.updateStatusValue(task, TaskStatusInit, []byte(""))
 
 	// 起一个goroutine监控任务的Owner key，被删掉时停止任务
 	on_delete := func(key string, val []byte) bool {
@@ -111,8 +99,45 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	task.cancelOwnerWatch = cancel
 	go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "Owner"), "DELETE", true, on_delete, ctxCancel)
 
-	task.rentTime = time.Now().Unix()
+	// 起一个goroutine做keepalive
 	task.leaseId = resp.ID
+	task.rentTime = time.Now().Unix()
+	go func() {
+		log.Infof("[%s] start keepalive...", task.param.TaskId)
+		tickChan := time.NewTicker(time.Second * 1).C
+		for {
+			select {
+			case <-tickChan:
+				if time.Now().Unix()-task.rentTime > *self.config.TaskOwnTime*3/4 {
+					resp, err := self.etcd.Client.KeepAliveOnce(context.TODO(), task.leaseId)
+					if err != nil {
+						self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+							"reason": "auto keepalive got error:" + err.Error()})
+						self.chRemove <- task
+					} else {
+						log.Debugf("[%s] auto keepalive ok, ttl:%d", task.param.TaskId, resp.TTL)
+						task.rentTime = time.Now().Unix()
+					}
+				}
+			case <-ctxCancel.Done():
+				log.Infof("[%s] keepalive goroutine got cancel, exit", task.param.TaskId)
+				return
+			}
+		}
+	}()
+
+	// 启动任务
+	err = self.config.CbTaskStart(&task.param)
+	if err == nil {
+		log.Debugf("CbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
+	} else {
+		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+			"reason": "CbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
+		self.updateStatusValue(task, TaskStatusError, []byte(""))
+		self.removeTask(task)
+		return false
+	}
+
 	log.Debugf("[%s] start task complete", task.param.TaskId)
 	return true
 }
@@ -123,6 +148,8 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 		log.Criticalf("[%s] task not found, taskType:%s", task.param.TaskId, task.param.TaskType)
 		return false
 	}
+
+	delete(self.taskProcessing, task.param.TaskId)
 
 	log.Infof("[%s] task remove, remove from queue", task.param.TaskId)
 	go func(task *_TaskInfo) {
@@ -150,9 +177,10 @@ func (self *TaskWorker) checkNewTasks() {
 				err := self.config.CbTaskAddCheck(&taskInfo.param)
 				if err == nil {
 					log.Debugf("[%s][%s] try take owner", taskInfo.param.TaskId, taskType)
-					if self.tryAddTask(taskInfo) {
-						self.taskProcessing[taskInfo.param.TaskId] = taskInfo
+					if !self.tryAddTask(taskInfo) {
+						log.Debugf("[%s][%s] take owner FAILED! skip", taskInfo.param.TaskId, taskType)
 					}
+					queue.Remove(t)
 				} else if err == ErrNotSupport {
 					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
 					queue.Remove(t)
@@ -161,6 +189,7 @@ func (self *TaskWorker) checkNewTasks() {
 					break
 				} else {
 					log.Criticalf("CbTaskAddCheck invalid return value [%v], client code error", err)
+					queue.Remove(t)
 				}
 			}
 		}
@@ -275,22 +304,11 @@ func (self *TaskWorker) Start() {
 func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userParam []byte) {
 	taskInfo, ok := self.taskProcessing[param.TaskId]
 	if !ok {
-		log.Warnf("[%s] task not found", param.TaskId)
+		log.Warnf("[%s][%s] task not found, status [%s]", param.TaskId, param.TaskType, status)
 		return
 	}
-
 	self.updateStatusValue(taskInfo, status, userParam)
-	if status == TaskStatusWorking {
-		resp, err := self.etcd.Client.KeepAliveOnce(context.TODO(), taskInfo.leaseId)
-		if err != nil {
-			self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
-				"reason": "keepalive got error:" + err.Error(), "status": fmt.Sprintf("%#v", taskInfo.status)})
-			self.chRemove <- taskInfo
-		} else {
-			log.Debugf("[%s] keepalive ok, ttl:%d", taskInfo.param.TaskId, resp.TTL)
-			taskInfo.rentTime = time.Now().Unix()
-		}
-	} else if status == TaskStatusComplete || status == TaskStatusError {
+	if status == TaskStatusComplete || status == TaskStatusError {
 		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo

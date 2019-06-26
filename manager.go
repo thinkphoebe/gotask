@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"fmt"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -64,10 +65,10 @@ func genTaskId() string {
 }
 
 func (self *TaskManager) readEtcdJson(taskId string, key string, value_out *[]byte, object_out interface{}) error {
-	vals, err := self.etcd.Get(*self.config.Etcd.KeyPrefix+"/"+key, false)
+	vals, err := self.etcd.Get(key, false)
 	if err != nil || len(vals) == 0 {
-		log.Infof("[%s] etcd.Get [%s] got err:%v", taskId, key, err)
-		return err
+		log.Infof("[%s] etcd.Get [%s] err:%v, len vals [%d]", taskId, key, err, len(vals))
+		return errors.New(fmt.Sprintf("etcd Get [%v], len vals [%d]", err, len(vals)))
 	}
 	if value_out != nil {
 		*value_out = vals[0]
@@ -108,7 +109,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 		log.Infof("[%s] remove complete task, status:%v, retryCount:%d", taskId, taskStatus, retryCount)
 		self.removeTask(taskId, "delete_complete")
 	} else {
-		if taskParam.Retry < 0 || retryCount < taskParam.Retry {
+		if taskParam.Retry < 0 || retryCount <= taskParam.Retry {
 			waitTime := int64(math.Pow(float64(retryCount)*3, 1.6))
 			if waitTime > 100 {
 				waitTime = 100
@@ -403,15 +404,14 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 		return false
 	}
 
-	retryCount := 0
+	var errInfo ErrorInfo
 	if haveError {
-		var errorInfo ErrorInfo
-		if self.readEtcdJson(taskId, self.itemKey(taskId, "ErrorInfo"), nil, errorInfo) == nil {
-			retryCount = errorInfo.RetryCount
+		if self.readEtcdJson(taskId, self.itemKey(taskId, "ErrorInfo"), nil, &errInfo) == nil {
+			log.Debugf("[%s] read ErrorInfo [%v]", taskId, errInfo)
 		}
-		retryCount += 1
+		errInfo.RetryCount += 1
 
-		errorBytes, _ := json.Marshal(errorInfo)
+		errorBytes, _ := json.Marshal(errInfo)
 		log.Infof("[%s] update ErrorInfo to:%v", taskId, string(errorBytes))
 		key := self.itemKey(taskId, "ErrorInfo")
 		if err := self.etcd.Put(key, string(errorBytes), 0); err != nil {
@@ -430,7 +430,7 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 	var statesBytes []byte
 	self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), &statesBytes, nil)
 	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
-		"task_type": taskParam.TaskType, "task_status": string(statesBytes), "error_count": retryCount})
+		"task_type": taskParam.TaskType, "task_status": string(statesBytes), "error_count": errInfo.RetryCount})
 	return true
 }
 
@@ -546,6 +546,11 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 			err.Error(), config.Etcd.Endpoints, config.Etcd.DialTimeout)
 		return err
 	}
+	self.chTaskTypesUpdate = make(chan string, 10)
+	self.chFetchUpdate = make(chan _FetchInfo, 100)
+	self.usersMap = make(map[string]int64)
+	self.taskTypesMap = make(map[string]int64)
+	self.fetchCount = make(map[string]int64)
 	log.Infof("Init OK")
 	return nil
 }
@@ -602,7 +607,8 @@ func (self *TaskManager) Start() {
 
 func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCount int) (taskId string, err error) {
 	var taskParam TaskParam
-	taskParam.TaskId = genTaskId()
+	taskId = genTaskId()
+	taskParam.TaskId = taskId
 	taskParam.TaskType = taskType
 	taskParam.UserId = userId
 	taskParam.Retry = retryCount
@@ -613,7 +619,7 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 	opInfo, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
 	ifs := []clientv3.Op{*opInfo}
 	opUser, _ := self.etcd.OpPut(*self.config.Etcd.KeyPrefix+"/Users/"+userId, "", 0)
-	opTaskType, _ := self.etcd.OpPut(*self.config.Etcd.KeyPrefix+"/TaskType/"+taskType, "", 0)
+	opTaskType, _ := self.etcd.OpPut(*self.config.Etcd.KeyPrefix+"/TaskTypes/"+taskType, "", 0)
 	opQueue, _ := self.etcd.OpPut(self.itemKey(taskId, "Queue/"+taskType+"/"+userId), "", 0)
 	ifs = append(ifs, *opUser, *opTaskType, *opQueue)
 
@@ -637,7 +643,7 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 
 func (self *TaskManager) Remove(taskId string) error {
 	err := self.removeTask(taskId, "delete_user")
-	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "task_remove", "task_id": taskId, "err": err.Error()})
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "task_remove", "task_id": taskId, "err": fmt.Sprintf("%v", err)})
 	return err
 }
 
