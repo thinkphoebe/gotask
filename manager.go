@@ -110,6 +110,11 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 		self.removeTask(taskId, "delete_complete")
 	} else {
 		if taskParam.Retry < 0 || retryCount <= taskParam.Retry {
+			logId := "recover_error"
+			if taskStatus.Status == TaskStatusWorking {
+				logId = "recover_timeout"
+			}
+
 			waitTime := int64(math.Pow(float64(retryCount)*3, 1.6))
 			if waitTime > 100 {
 				waitTime = 100
@@ -117,9 +122,8 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 			if waitTime <= 0 {
 				waitTime = 1
 			}
-			logId := "recover_error"
-			if taskStatus.Status == "working" {
-				logId = "recover_timeout"
+			if taskStatus.Status == TaskStatusRestart {
+				waitTime = 1
 			}
 
 			log.Infof("[%s] wait %ds recover task, status:%v, retryCount:%d", taskId, waitTime, taskStatus, retryCount)

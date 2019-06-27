@@ -19,6 +19,7 @@ type _TaskInfo struct {
 	status           TaskStatus
 	foundTime        int64
 	rentTime         int64
+	lastOORTime      int64 // last out of resource time, used for log print
 	leaseId          clientv3.LeaseID
 	cancelOwnerWatch context.CancelFunc
 	errorCleaned     bool
@@ -104,7 +105,8 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	task.rentTime = time.Now().Unix()
 	go func() {
 		log.Infof("[%s] start keepalive...", task.param.TaskId)
-		tickChan := time.NewTicker(time.Second * 1).C
+		ticker := time.NewTicker(time.Second * 1)
+		tickChan := ticker.C
 		for {
 			select {
 			case <-tickChan:
@@ -121,6 +123,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 				}
 			case <-ctxCancel.Done():
 				log.Infof("[%s] keepalive goroutine got cancel, exit", task.param.TaskId)
+				ticker.Stop()
 				return
 			}
 		}
@@ -174,6 +177,11 @@ func (self *TaskWorker) checkNewTasks() {
 				log.Debugf("[%s][%s] remove timeout from queue", taskInfo.param.TaskId, taskType)
 				queue.Remove(t)
 			} else {
+				// 未避免out of resource时频繁检测导致日志打印过多，这里加一个时间限制
+				if time.Now().Unix()-taskInfo.lastOORTime < 5 {
+					continue
+				}
+
 				err := self.config.CbTaskAddCheck(&taskInfo.param)
 				if err == nil {
 					log.Debugf("[%s][%s] try take owner", taskInfo.param.TaskId, taskType)
@@ -185,6 +193,7 @@ func (self *TaskWorker) checkNewTasks() {
 					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
 					queue.Remove(t)
 				} else if err == ErrOutOfResource {
+					taskInfo.lastOORTime = time.Now().Unix()
 					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], pause check", taskInfo.param.TaskId, taskType, err.Error())
 					break
 				} else {
@@ -285,16 +294,15 @@ func (self *TaskWorker) Start() {
 	go func() {
 		self.watchNewTask()
 		self.scanExistingTasks()
-
+		tickChan := time.NewTicker(time.Millisecond * 100).C
 		for {
 			select {
 			case task := <-self.chTask:
 				self.taskQueue[task.param.TaskType].PushBack(task)
 			case task := <-self.chRemove:
 				self.removeTask(task)
-			default:
+			case <-tickChan:
 				self.checkNewTasks()
-				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()
@@ -308,7 +316,7 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userPa
 		return
 	}
 	self.updateStatusValue(taskInfo, status, userParam)
-	if status == TaskStatusComplete || status == TaskStatusError {
+	if status == TaskStatusComplete || status == TaskStatusError || status == TaskStatusRestart {
 		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo

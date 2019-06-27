@@ -98,4 +98,5 @@ var (
 	TaskStatusError    = "error"
 	TaskStatusWorking  = "working"
 	TaskStatusComplete = "complete"
+	TaskStatusRestart  = "restart" // 此状态的任务会立即重新分发，不受retryCount的限制。实时流退出时可使用此状态
 )
