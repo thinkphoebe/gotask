@@ -7,12 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
 	"strings"
 	"time"
-	"fmt"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
@@ -30,6 +30,7 @@ type TaskManager struct {
 	config          TaskManagerConfig
 	etcd            goetcd.Etcd
 	electionSession *concurrency.Session
+	inited          bool
 
 	//保存各个userId
 	usersMap map[string]int64
@@ -555,6 +556,7 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 	self.usersMap = make(map[string]int64)
 	self.taskTypesMap = make(map[string]int64)
 	self.fetchCount = make(map[string]int64)
+	self.inited = true
 	log.Infof("Init OK")
 	return nil
 }
@@ -562,9 +564,13 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 // ATTENTION 本函数会调用os.Exit()使整个程序退出
 func (self *TaskManager) Exit() error {
 	log.Infof("Exit...")
-	self.electionSession.Close() //使slave立即election succeed提供服务
-	self.etcd.Exit()
-	os.Exit(0)
+	if self.inited {
+		if self.electionSession != nil {
+			self.electionSession.Close() //使slave立即election succeed提供服务
+		}
+		self.etcd.Exit()
+		os.Exit(0)
+	}
 	return nil
 }
 
