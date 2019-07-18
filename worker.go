@@ -178,7 +178,7 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.Remove(t)
 			} else {
 				// 未避免out of resource时频繁检测导致日志打印过多，这里加一个时间限制
-				if time.Now().Unix()-taskInfo.lastOORTime < 5 {
+				if time.Now().UnixNano()-taskInfo.lastOORTime < int64(1 * time.Second) {
 					continue
 				}
 
@@ -193,7 +193,7 @@ func (self *TaskWorker) checkNewTasks() {
 					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
 					queue.Remove(t)
 				} else if err == ErrOutOfResource {
-					taskInfo.lastOORTime = time.Now().Unix()
+					taskInfo.lastOORTime = time.Now().UnixNano()
 					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], pause check", taskInfo.param.TaskId, taskType, err.Error())
 					break
 				} else {
