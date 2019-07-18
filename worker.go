@@ -178,7 +178,7 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.Remove(t)
 			} else {
 				// 未避免out of resource时频繁检测导致日志打印过多，这里加一个时间限制
-				if time.Now().UnixNano()-taskInfo.lastOORTime < int64(1 * time.Second) {
+				if time.Now().UnixNano()-taskInfo.lastOORTime < int64(1*time.Second) {
 					continue
 				}
 
@@ -317,7 +317,10 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userPa
 	}
 	self.updateStatusValue(taskInfo, status, userParam)
 	if status == TaskStatusComplete || status == TaskStatusError || status == TaskStatusRestart {
+		preTime := taskInfo.status.StartTime - param.AddTime
+		processingTime := time.Now().Unix() - taskInfo.status.StartTime
 		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
+			"pre_time": preTime, "processing_time": processingTime, "status_str": status,
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo
 	}

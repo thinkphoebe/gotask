@@ -454,9 +454,14 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 		statusBytes, _ = json.Marshal(&taskStatus)
 	}
 
+	var errInfo ErrorInfo
+	var errBytes []byte
+	self.readEtcdJson(taskId, self.itemKey(taskId, "ErrorInfo"), &errBytes, &errInfo)
+
 	var delInfo DeletedInfo
 	delInfo.TaskParam = paramBytes
-	delInfo.TaskStatus = string(statusBytes)
+	delInfo.TaskStatus = statusBytes
+	delInfo.ErrorInfo = errBytes
 	delInfo.DeleteTime = time.Now().Unix()
 	delBytes, _ := json.Marshal(delInfo)
 
@@ -488,8 +493,11 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	if logId == "delete_error" {
 		param = string(paramBytes)
 	}
+	preTime := taskStatus.StartTime - taskParam.AddTime
+	processingTime := time.Now().Unix() - taskStatus.StartTime
 	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
-		"task_type": taskParam.TaskType, "task_status": taskStatus, "task_param": param})
+		"task_type": taskParam.TaskType, "task_status": taskStatus, "task_param": param,
+		"pre_time": preTime, "processing_time": processingTime, "retry_count": errInfo.RetryCount})
 	return nil
 }
 

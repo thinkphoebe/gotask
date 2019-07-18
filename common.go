@@ -85,7 +85,8 @@ type ErrorInfo struct {
 type DeletedInfo struct {
 	DeleteTime int64  `json:"deleteTime,omitempty"`
 	TaskParam  []byte `json:"taskParam,omitempty"`
-	TaskStatus string `json:"taskStatus,omitempty"`
+	TaskStatus []byte `json:"taskStatus,omitempty"`
+	ErrorInfo  []byte `json:"errorInfo,omitempty"`
 }
 
 var (
