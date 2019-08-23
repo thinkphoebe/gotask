@@ -31,6 +31,7 @@ type TaskManager struct {
 	etcd            goetcd.Etcd
 	electionSession *concurrency.Session
 	inited          bool
+	master          bool
 
 	//保存各个userId
 	usersMap map[string]int64
@@ -582,9 +583,10 @@ func (self *TaskManager) Exit() error {
 	return nil
 }
 
-func (self *TaskManager) Start() {
+func (self *TaskManager) StartMaster() {
 	self.electionSession = goetcd.DoElection(self.etcd.Client, *self.config.Etcd.SessionTimeout,
 		*self.config.Etcd.KeyPrefix+"/Election", *self.config.Etcd.LeaseFile)
+	self.master = true
 
 	go func(c <-chan struct{}) {
 		<-c
@@ -621,6 +623,10 @@ func (self *TaskManager) Start() {
 		log.Warnf("clean completed")
 		time.Sleep(time.Second * 3600)
 	}
+}
+
+func (self *TaskManager) IsMaster() bool {
+	return self.master
 }
 
 func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCount int) (taskId string, err error) {
