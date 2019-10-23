@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -290,7 +291,7 @@ func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 	return nil
 }
 
-func (self *TaskWorker) Start() {
+func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 	go func() {
 		self.watchNewTask()
 		self.scanExistingTasks()
@@ -306,6 +307,37 @@ func (self *TaskWorker) Start() {
 			}
 		}
 	}()
+
+	if exitKeepAliveFail {
+		go func() {
+			ch := make(chan string, 100)
+			onKeepAlive := func(key string, val []byte) bool {
+				msg := string(val)
+				ch <- msg
+				log.Infof("read keepalive [%s]", msg)
+				return true
+			}
+			go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/KeepAlive", "PUT", true, onKeepAlive, nil)
+
+			tickChan := time.NewTicker(time.Second * 60).C
+			lastUpdate := time.Now().Unix()
+			for {
+				select {
+				case <-ch:
+					lastUpdate = time.Now().Unix()
+				case <-tickChan:
+					// mdp-manager每60s更新一次/KeepAlive
+					if time.Now().Unix()-lastUpdate > 60*5 {
+						self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
+							"now": time.Now().Unix(), "last_update": lastUpdate})
+						self.etcd.Exit()
+						os.Exit(0)
+					}
+				}
+			}
+		}()
+	}
+
 	log.Infof("Start OK")
 }
 

@@ -553,19 +553,42 @@ func (self *TaskManager) statusCleanCallback(key string, val []byte) bool {
 }
 
 func (self *TaskManager) Init(config *TaskManagerConfig) error {
-	self.config = *config
 	err := self.etcd.Init(*config.Etcd.Endpoints, *config.Etcd.DialTimeout)
 	if err != nil {
 		log.Criticalf("etcd.Init got err [%s], Endpoints [%#v], DialTimeout [%d]",
 			err.Error(), config.Etcd.Endpoints, config.Etcd.DialTimeout)
 		return err
 	}
+
+	self.config = *config
 	self.chTaskTypesUpdate = make(chan string, 10)
 	self.chFetchUpdate = make(chan _FetchInfo, 100)
 	self.usersMap = make(map[string]int64)
 	self.taskTypesMap = make(map[string]int64)
 	self.fetchCount = make(map[string]int64)
 	self.inited = true
+
+	// etcd使用中发现有watch收不到回调的情况，重启后恢复。怀疑和网络出问题后恢复有关。
+	// 这里做一个容错处理，manager定期写入etcd的一个key，超过10分钟写入失败，认为etcd有问题，退出重启。
+	// worker也watch此key，超时没有回调后认为etcd有问题，退出重启。
+	go func() {
+		failCount := 0
+		for {
+			key := *self.config.Etcd.KeyPrefix + "/KeepAlive"
+			if err := self.etcd.Put(key, time.Now().String(), 0); err != nil {
+				self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_keepalive", "fail_count": failCount, "err": err.Error()})
+				failCount += 1
+			} else {
+				failCount = 0
+			}
+			if failCount >= 10 {
+				self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed"})
+				self.Exit()
+			}
+			time.Sleep(time.Second * 60)
+		}
+	}()
+
 	log.Infof("Init OK")
 	return nil
 }
