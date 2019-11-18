@@ -178,11 +178,6 @@ func (self *TaskWorker) checkNewTasks() {
 				log.Debugf("[%s][%s] remove timeout from queue", taskInfo.param.TaskId, taskType)
 				queue.Remove(t)
 			} else {
-				// 未避免out of resource时频繁检测导致日志打印过多，这里加一个时间限制
-				if time.Now().UnixNano()-taskInfo.lastOORTime < int64(1*time.Second) {
-					continue
-				}
-
 				err := self.config.CbTaskAddCheck(&taskInfo.param)
 				if err == nil {
 					log.Debugf("[%s][%s] try take owner", taskInfo.param.TaskId, taskType)
@@ -314,7 +309,6 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 			onKeepAlive := func(key string, val []byte) bool {
 				msg := string(val)
 				ch <- msg
-				log.Infof("read keepalive [%s]", msg)
 				return true
 			}
 			go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/KeepAlive", "PUT", true, onKeepAlive, nil)
