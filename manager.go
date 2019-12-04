@@ -105,15 +105,19 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 	}
 
 	var taskStatus TaskStatus
-	if self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), nil, &taskStatus) != nil ||
-		taskStatus.Status == "complete" {
+	err := self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), nil, &taskStatus)
+	if err == nil && taskStatus.Status == TaskStatusComplete {
 		//任务正常结束
 		log.Infof("[%s] remove complete task, status:%v, retryCount:%d", taskId, taskStatus, retryCount)
 		self.removeTask(taskId, "delete_complete")
 	} else {
-		if taskParam.Retry < 0 || retryCount <= taskParam.Retry {
+		// err != nil的情况一般不应出现，仅在Worker进程创建了Owner但还未创建Status的瞬间挂掉的情况下可能出现
+		// 为避免任务被误删err != nil时添加了3次重试
+		if taskParam.Retry < 0 || retryCount <= taskParam.Retry || err != nil && retryCount < 3 {
 			logId := "recover_error"
-			if taskStatus.Status == TaskStatusWorking {
+			if err != nil {
+				logId = "recover_unknown_status"
+			} else if taskStatus.Status == TaskStatusWorking {
 				logId = "recover_timeout"
 			}
 
@@ -534,6 +538,13 @@ func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
 }
 
 func (self *TaskManager) statusCleanCallback(key string, val []byte) bool {
+	taskId := getKeyEnd(key)
+	if self.readEtcdJson(taskId, self.itemKey(taskId, "TaskParam"), nil, nil) == nil {
+		return true
+	} else {
+		log.Infof("[%s] read TaskParam FAILED, task may be deleted, continue clean", taskId)
+	}
+
 	var taskStatus TaskStatus
 	err := json.Unmarshal(val, &taskStatus)
 	if err != nil {
