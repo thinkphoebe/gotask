@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
@@ -38,6 +39,7 @@ type TaskWorker struct {
 
 	// 已获取Owner正在处理的任务的信息
 	taskProcessing map[string]*_TaskInfo
+	mutex          sync.Mutex
 }
 
 func (self *TaskWorker) itemKey(taskId, item string) string {
@@ -70,7 +72,9 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 		log.Infof("[%s] FAILED!", task.param.TaskId)
 		return false
 	}
+	self.mutex.Lock()
 	self.taskProcessing[task.param.TaskId] = task
+	self.mutex.Unlock()
 	log.Infof("[%s] take task owner succeed", task.param.TaskId)
 	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId, "task_type": task.param.TaskType})
 
@@ -147,12 +151,13 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 }
 
 func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
 	t, ok := self.taskProcessing[task.param.TaskId]
 	if !ok {
 		log.Criticalf("[%s] task not found, taskType:%s", task.param.TaskId, task.param.TaskType)
 		return false
 	}
-
 	delete(self.taskProcessing, task.param.TaskId)
 
 	log.Infof("[%s] task remove, remove from queue", task.param.TaskId)
@@ -336,7 +341,9 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 }
 
 func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userParam []byte) {
+	self.mutex.Lock()
 	taskInfo, ok := self.taskProcessing[param.TaskId]
+	self.mutex.Unlock()
 	if !ok {
 		log.Warnf("[%s][%s] task not found, status [%s]", param.TaskId, param.TaskType, status)
 		return
