@@ -58,6 +58,10 @@ type TaskWorkerConfig struct {
 	// TaskWorker由于续租失败等原因需要终止任务执行时会调用此回调，用户需要在此回调中停止任务并释放相关的资源
 	CbTaskStop func(param *TaskParam) error `json:"-"`
 
+	// 运行时修改任务参数
+	// 如不支持修改可将此函数指针设置为nil
+	CbTaskModify func(param *TaskParam) error `json:"-"`
+
 	// TaskWorker有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
 	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }

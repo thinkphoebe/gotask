@@ -33,17 +33,17 @@ type TaskManager struct {
 	inited          bool
 	master          bool
 
-	//保存各个userId
+	// 保存各个userId
 	usersMap map[string]int64
 
-	//保存各个taskType
+	// 保存各个taskType
 	taskTypesMap map[string]int64
-	//为避免多线程读写将修改值发送到此chan统一修改
+	// 为避免多线程读写将修改值发送到此chan统一修改
 	chTaskTypesUpdate chan string
 
-	//从该chan读取到数据时更新fetch，值为GFetchCount需要更新的差值
+	// 从该chan读取到数据时更新fetch，值为GFetchCount需要更新的差值
 	chFetchUpdate chan _FetchInfo
-	//记录fetch节点的数量
+	// 记录fetch节点的数量
 	fetchCount map[string]int64
 }
 
@@ -107,7 +107,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 	var taskStatus TaskStatus
 	err := self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), nil, &taskStatus)
 	if err == nil && taskStatus.Status == TaskStatusComplete {
-		//任务正常结束
+		// 任务正常结束
 		log.Infof("[%s] remove complete task, status:%v, retryCount:%d", taskId, taskStatus, retryCount)
 		self.removeTask(taskId, "delete_complete")
 	} else {
@@ -140,7 +140,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 					"value": logId, "ttl": waitTime})
 			}
 		} else {
-			//删除出错任务
+			// 删除出错任务
 			log.Infof("[%s] remove error task, status:%v, retryCount:%d", taskId, taskStatus, int(retryCount))
 			self.removeTask(taskId, "delete_error")
 		}
@@ -277,7 +277,8 @@ func (self *TaskManager) updateFetch() {
 			return
 		}
 		if !resp.Succeeded {
-			log.Infof("moveTask [%s] resp not Succeed!", key)
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+				"error": "moveTask self.etcd.Txn not Succeeded"})
 			return
 		}
 
@@ -609,7 +610,7 @@ func (self *TaskManager) Exit() error {
 	log.Infof("Exit...")
 	if self.inited {
 		if self.electionSession != nil {
-			self.electionSession.Close() //使slave立即election succeed提供服务
+			self.electionSession.Close() // 使slave立即election succeed提供服务
 		}
 		self.etcd.Exit()
 		os.Exit(0)
@@ -641,12 +642,12 @@ func (self *TaskManager) StartMaster() {
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Owner/", "DELETE", true, self.onKeyOwnerDelete, nil)
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Wait/", "DELETE", true, self.onKeyWaitDelete, nil)
 
-	//为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
+	// 为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
 	log.Warnf("start recover...")
 	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Processing/", self.recoverCallback, -1, nil)
 	log.Warnf("recover completed")
 
-	//定期清理${task_root}/deleted中过期的key
+	// 定期清理${task_root}/deleted中过期的key
 	for {
 		log.Warnf("start deleted clean...")
 		opts := []clientv3.OpOption{}
@@ -705,12 +706,52 @@ func (self *TaskManager) Remove(taskId string) error {
 	return err
 }
 
+func (self *TaskManager) Modify(taskId string, userParam []byte) error {
+	var key = self.itemKey(taskId, "TaskParam")
+	var taskParam TaskParam
+	var paramBytes []byte
+	if self.readEtcdJson(taskId, key, &paramBytes, &taskParam) != nil {
+		log.Errorf("[%s] read TaskParam FAILED, task may be deleted", taskId)
+		return errors.New("task not exist")
+	}
+
+	taskParam.UserParam = userParam
+	paramBytes, _ = json.Marshal(taskParam)
+
+	cmpParam := clientv3.Compare(clientv3.CreateRevision(self.itemKey(taskId, "Processing")), "!=", 0)
+	opTaskParam, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
+	opProc, _ := self.etcd.OpPut(self.itemKey(taskId, "Processing"), string(paramBytes), 0)
+	// ATTENTION 修改任务会导致刷新Fetch key
+	opFetch, err := self.etcd.OpPut(self.itemKey(taskId, "Fetch/"+taskParam.TaskType), string(paramBytes), *self.config.FetchTimeout)
+	if err != nil {
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
+			"ttl": self.config.FetchTimeout, "error": "moveTask self.etcd.OpPut got err:" + err.Error()})
+		return errors.New("etcd_grant got err:%s" + err.Error())
+	}
+
+	ifs := []clientv3.Op{*opTaskParam, *opProc, *opFetch}
+	elses := []clientv3.Op{*opTaskParam}
+	resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, elses)
+	if err != nil {
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+			"error": "modifyTask self.etcd.Txn got err:" + err.Error()})
+		return errors.New("etcd_txn got err:%s" + err.Error())
+	}
+	if !resp.Succeeded {
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+			"error": "modifyTask self.etcd.Txn not Succeeded"})
+		return errors.New("etcd.Txn not Succeeded")
+	}
+
+	return nil
+}
+
 func (self *TaskManager) Query(taskId string) error {
-	//TODO
+	// TODO
 	return nil
 }
 
 func (self *TaskManager) List() error {
-	//TODO
+	// TODO
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/thinkphoebe/goetcd"
@@ -24,6 +25,7 @@ type _TaskInfo struct {
 	lastOORTime      int64 // last out of resource time, used for log print
 	leaseId          clientv3.LeaseID
 	cancelOwnerWatch context.CancelFunc
+	cancelParamWatch context.CancelFunc
 	errorCleaned     bool
 }
 
@@ -105,6 +107,30 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	task.cancelOwnerWatch = cancel
 	go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "Owner"), "DELETE", true, on_delete, ctxCancel)
 
+	// 起一个goroutine监控任务参数修改
+	if self.config.CbTaskModify != nil {
+		on_put := func(key string, val []byte) bool {
+			if bytes.Compare(val, task.param.UserParam) == 0 {
+				self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
+					"result": "no change, skipped"})
+				return true
+			}
+
+			if err := json.Unmarshal(val, &task.param); err != nil {
+				self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
+					"result": fmt.Sprintf("json.Unmarshal error [%s], key [%s], val [%s]", err.Error(), key, string(val))})
+				return true
+			}
+			self.config.CbTaskModify(&task.param)
+			self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
+				"result": "processed"})
+			return true
+		}
+		ctxCancel, cancel := context.WithCancel(context.Background())
+		task.cancelParamWatch = cancel
+		go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "TaskParam"), "PUT", true, on_put, ctxCancel)
+	}
+
 	// 起一个goroutine做keepalive
 	task.leaseId = resp.ID
 	task.rentTime = time.Now().Unix()
@@ -166,6 +192,8 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 		self.config.CbTaskStop(&task.param)
 		log.Debugf("[%s] task remove, call cancelOwnerWatch", task.param.TaskId)
 		task.cancelOwnerWatch()
+		log.Debugf("[%s] task remove, call cancelParamWatch", task.param.TaskId)
+		task.cancelParamWatch()
 		log.Debugf("[%s] task remove, Del owner", task.param.TaskId)
 		self.etcd.Del(self.itemKey(task.param.TaskId, "Owner"), false)
 		log.Infof("[%s] task remove complete", task.param.TaskId)
