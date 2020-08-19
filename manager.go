@@ -706,6 +706,30 @@ func (self *TaskManager) Remove(taskId string) error {
 	return err
 }
 
+// 本函数主要用于清理误添加的任务的情况，一般不应调用
+// 安全起见，userId、taskType不能为空
+func (self *TaskManager) Clean(userId, taskType string) error {
+	if userId == "" || taskType == "" {
+		return errors.New(fmt.Sprintf("userId [%s] and taskType [%s] should not be empty", userId, taskType))
+	}
+
+	on_task := func(key string, val []byte) bool {
+		var taskParam TaskParam
+		var paramBytes []byte
+		taskId := getKeyEnd(key)
+		if self.readEtcdJson(taskId, key, &paramBytes, &taskParam) != nil {
+			log.Errorf("[%s] read TaskParam FAILED, task may be deleted", taskId)
+			return true
+		}
+		if taskParam.UserId != userId || taskParam.TaskType != taskType {
+			return true
+		}
+		self.removeTask(taskId, "delete_clean")
+		return true
+	}
+	return self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", on_task, -1, nil)
+}
+
 func (self *TaskManager) Modify(taskId string, userParam []byte) error {
 	var key = self.itemKey(taskId, "TaskParam")
 	var taskParam TaskParam
