@@ -8,8 +8,8 @@ package gotask
 │   ├── {UsersID 1}
 │   ├── {......}
 │   └── {UsersID n}
-├── TaskTypes				key: live, offline, download, video_frame_extract, audio_split. value: 0, 1
-│   ├── {TaskType 1}        value为0时直接分发，value为1时先排队。
+├── TaskTypes				key: live, offline, download, video_frame_extract, audio_split
+│   ├── {TaskType 1}
 │   ├── {......}
 │   └── {TaskType n}
 ├── TaskParam
@@ -49,7 +49,11 @@ package gotask
 │   ├── {TaskID 1}
 │   ├── {......}
 │   └── {TaskID n}
-├── Wait
+├── WaitRecover
+│   ├── {TaskID 1}
+│   ├── {......}
+│   └── {TaskID n}
+├── WaitResource
 │   ├── {TaskID 1}
 │   ├── {......}
 │   └── {TaskID n}

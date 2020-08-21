@@ -1,7 +1,6 @@
 package gotask
 
 import (
-	"errors"
 	"time"
 
 	log "github.com/thinkphoebe/golog"
@@ -28,11 +27,30 @@ type TaskManagerConfig struct {
 	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }
 
+type TaskResource struct {
+	Need         int // 预估任务需要的数量，准确或者比实际需要的大一些
+	AllocateTime int // 预计从任务启动到该资源分配完毕需要的时间，比实际需要的大一些
+	Reserve      int // AllocateTime过后，任务运行过程中需要预留的资源
+}
+
 type TaskWorkerConfig struct {
 	Etcd EtcdConfig `json:"etcd"`
 
-	// 监控的任务类型，有匹配TaskTypes的任务添加时会尝试获取执行
-	TaskTypes *[]string `json:"task_types"`
+	// 监控的任务类型，有匹配TaskTypes的任务添加时会尝试获取执行。key: TaskType, value: priority
+	// priority值越小，优先级越高
+	TaskTypes *map[string]int `json:"task_types"`
+
+	// 资源的类型，key: ResourceType, value: describe
+	ResourceTypes *map[int]string `json:"resource_types"`
+
+	// 更新资源占用的最小时间间隔，单位：秒
+	ResourceUpdateInterval *int64 `json:"resource_update_interval"`
+
+	// dispatch count超过此阈值时任务会被放入first队列，尝试等待资源处理
+	DispatchThreshold *int `json:"dispatch_threshold"`
+
+	// 同一任务最大Wait Resource Worker的数量
+	MaxWaitResourceWorkers *int `json:"max_wait_resource_workers"`
 
 	// 队列中超过MaxQueueTime的任务直接删除，不再尝试获取执行
 	MaxQueueTime *int64 `json:"max_queue_time"`
@@ -42,37 +60,40 @@ type TaskWorkerConfig struct {
 	TaskOwnTime *int64 `json:"task_own_time"`
 
 	// 该值目的是用来区分client的实例，会写入key Owner的value中，目前没有实际用途
-	InstanceId string
+	InstanceId string `json:"-"`
 
-	// TaskWorker调用此回调确认某个任务是否可以尝试获取并执行
-	// 返回nil时表示可以添加任务
-	// 返回ErrOutOfResource时表示没有资源，不再继续处理任务列表
-	// 返回其它ErrNotSupport时跳过该任务继续处理任务列表
-	CbTaskAddCheck func(param *TaskParam) error `json:"-"`
+	// 在调用以下CbXxx函数时通过handle参数回传，用于回调函数区分对象实例
+	InstanceHandle interface{} `json:"-"`
+
+	CbGetResourceInfo func(handle interface{}, resType int) (total int, used int, err error) `json:"-"`
+	// 获取任务预估需要占用的资源，仅根据任务参数给出一个安全值，避免非常耗时或block的资源检查
+	// key: resType，资源类型，如CPU、GPU、Codec等
+	CbGetTaskResources func(handle interface{}, param *TaskParam) map[int]*TaskResource `json:"-"`
 
 	// TaskWorker获取任务成功后调用此回调。用户可在此回调中启动执行任务
 	// 返回nil表示任务添加成功
 	// 返回非nil时将该任务标记为执行失败并Owner，之后manager根据Retry和ErrorCount确定是否重新分发
-	CbTaskStart func(param *TaskParam) error `json:"-"`
+	CbTaskStart func(handle interface{}, param *TaskParam) error `json:"-"`
 
 	// TaskWorker由于续租失败等原因需要终止任务执行时会调用此回调，用户需要在此回调中停止任务并释放相关的资源
-	CbTaskStop func(param *TaskParam) error `json:"-"`
+	CbTaskStop func(handle interface{}, param *TaskParam) error `json:"-"`
 
 	// 运行时修改任务参数
 	// 如不支持修改可将此函数指针设置为nil
-	CbTaskModify func(param *TaskParam) error `json:"-"`
+	CbTaskModify func(handle interface{}, param *TaskParam) error `json:"-"`
 
 	// TaskWorker有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
-	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
+	CbLogJson func(handle interface{}, level log.LogLevel, j log.Json) `json:"-"`
 }
 
 type TaskParam struct {
-	TaskId    string `json:"taskId,omitempty"`
-	TaskType  string `json:"taskType,omitempty"`
-	UserId    string `json:"userId,omitempty"`
-	Retry     int    `json:"retry,omitempty"`    // 0：不重试，+n：重试次数，-1：无限重试
-	AddTime   int64  `json:"add_time,omitempty"` // 任务的添加时间，unix second
-	UserParam []byte `json:"userParam,omitempty"`
+	TaskId        string `json:"taskId,omitempty"`
+	TaskType      string `json:"taskType,omitempty"`
+	UserId        string `json:"userId,omitempty"`
+	Retry         int    `json:"retry,omitempty"`          // 0：不重试，+n：重试次数，-1：无限重试
+	AddTime       int64  `json:"add_time,omitempty"`       // 任务的添加时间，unix second
+	DispatchCount int    `json:"dispatch_count,omitempty"` // 已被重新分发的次数
+	UserParam     []byte `json:"userParam,omitempty"`
 }
 
 type TaskStatus struct {
@@ -92,11 +113,6 @@ type DeletedInfo struct {
 	TaskStatus []byte `json:"taskStatus,omitempty"`
 	ErrorInfo  []byte `json:"errorInfo,omitempty"`
 }
-
-var (
-	ErrOutOfResource = errors.New("Out of resource")
-	ErrNotSupport    = errors.New("Not Support")
-)
 
 var (
 	TaskStatusInit     = "init"

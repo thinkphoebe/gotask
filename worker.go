@@ -1,31 +1,44 @@
 package gotask
 
-import "C"
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-	"bytes"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/thinkphoebe/goetcd"
 	log "github.com/thinkphoebe/golog"
 )
 
+type _ResourceInfo struct {
+	resType int
+	total   int
+	used    int
+}
+
+type _PriorityQueue struct {
+	first        *list.List // 多次被dispatch的任务，优先检查
+	second       *list.List
+	waitResource *_TaskInfo // wait resource只对当前的priority有效，wait期间如有更高priority的任务资源会被分走
+	mutex        sync.Mutex
+}
+
 type _TaskInfo struct {
 	param            TaskParam
 	status           TaskStatus
+	resource         map[int]*TaskResource
 	foundTime        int64
 	rentTime         int64
-	lastOORTime      int64 // last out of resource time, used for log print
 	leaseId          clientv3.LeaseID
 	cancelOwnerWatch context.CancelFunc
-	cancelParamWatch context.CancelFunc
+	cancelParamWatch context.CancelFunc // 两处使用：WaitResource时监控任务的删除；执行过程中监控参数修改
 	errorCleaned     bool
 }
 
@@ -36,16 +49,25 @@ type TaskWorker struct {
 	chTask   chan *_TaskInfo
 	chRemove chan *_TaskInfo
 
-	// watch到的任务队列，每taskType一个队列
-	taskQueue map[string]*list.List
+	lastResourceUpdate int64
+	resources          map[int]*_ResourceInfo // key: resource type
 
-	// 已获取Owner正在处理的任务的信息
+	// watch到的任务队列，key: priority
+	taskQueues map[int]*_PriorityQueue
+	// 辅助queues按照priority排序
+	priorities []int
+
+	// 已获取Owner正在处理的任务的信息。会在UpdateTaskStatus()被Client调用，所以加锁
 	taskProcessing map[string]*_TaskInfo
 	mutex          sync.Mutex
 }
 
 func (self *TaskWorker) itemKey(taskId, item string) string {
 	return *self.config.Etcd.KeyPrefix + "/" + item + "/" + taskId
+}
+
+func (self *TaskWorker) logJson(level log.LogLevel, j log.Json) {
+	self.config.CbLogJson(self.config.InstanceHandle, level, j)
 }
 
 func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
@@ -78,7 +100,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	self.taskProcessing[task.param.TaskId] = task
 	self.mutex.Unlock()
 	log.Infof("[%s] take task owner succeed", task.param.TaskId)
-	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId, "task_type": task.param.TaskType})
+	self.logJson(log.LevelInfo, log.Json{"cmd": "add_task", "task_id": task.param.TaskId, "task_type": task.param.TaskType})
 
 	// 如果已有Status key则读取
 	vals, err := self.etcd.Get(self.itemKey(task.param.TaskId, "Status"), false)
@@ -97,38 +119,37 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 
 	// 起一个goroutine监控任务的Owner key，被删掉时停止任务
 	on_delete := func(key string, val []byte) bool {
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+		self.logJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 			"reason": "owner key deleted", "status": fmt.Sprintf("%#v", task.status)})
-		self.config.CbTaskStop(&task.param)
+		self.config.CbTaskStop(self.config.InstanceHandle, &task.param)
 		self.chRemove <- task
 		return true
 	}
 	ctxCancel, cancel := context.WithCancel(context.Background())
 	task.cancelOwnerWatch = cancel
-	go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "Owner"), "DELETE", true, on_delete, ctxCancel)
+	go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "Owner"), "DELETE", false, on_delete, ctxCancel)
 
 	// 起一个goroutine监控任务参数修改
 	if self.config.CbTaskModify != nil {
 		on_put := func(key string, val []byte) bool {
 			if bytes.Compare(val, task.param.UserParam) == 0 {
-				self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
+				self.logJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
 					"result": "no change, skipped"})
 				return true
 			}
 
 			if err := json.Unmarshal(val, &task.param); err != nil {
-				self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
+				self.logJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
 					"result": fmt.Sprintf("json.Unmarshal error [%s], key [%s], val [%s]", err.Error(), key, string(val))})
 				return true
 			}
-			self.config.CbTaskModify(&task.param)
-			self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId,
-				"result": "processed"})
+			self.config.CbTaskModify(self.config.InstanceHandle, &task.param)
+			self.logJson(log.LevelInfo, log.Json{"cmd": "modify_task", "task_id": task.param.TaskId, "result": "processed"})
 			return true
 		}
 		ctxCancel, cancel := context.WithCancel(context.Background())
 		task.cancelParamWatch = cancel
-		go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "TaskParam"), "PUT", true, on_put, ctxCancel)
+		go self.etcd.WatchCallback(self.itemKey(task.param.TaskId, "TaskParam"), "PUT", false, on_put, ctxCancel)
 	}
 
 	// 起一个goroutine做keepalive
@@ -144,7 +165,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 				if time.Now().Unix()-task.rentTime > *self.config.TaskOwnTime*3/4 {
 					resp, err := self.etcd.Client.KeepAliveOnce(context.TODO(), task.leaseId)
 					if err != nil {
-						self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+						self.logJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 							"reason": "auto keepalive got error:" + err.Error()})
 						self.chRemove <- task
 					} else {
@@ -161,11 +182,11 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	}()
 
 	// 启动任务
-	err = self.config.CbTaskStart(&task.param)
+	err = self.config.CbTaskStart(self.config.InstanceHandle, &task.param)
 	if err == nil {
 		log.Debugf("CbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
 	} else {
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
+		self.logJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 			"reason": "CbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
 		self.updateStatusValue(task, TaskStatusError, []byte(""))
 		self.removeTask(task)
@@ -189,12 +210,14 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 	log.Infof("[%s] task remove, remove from queue", task.param.TaskId)
 	go func(task *_TaskInfo) {
 		log.Debugf("[%s] task remove, call CbTaskStop", task.param.TaskId)
-		self.config.CbTaskStop(&task.param)
+		self.config.CbTaskStop(self.config.InstanceHandle, &task.param)
 		log.Debugf("[%s] task remove, call cancelOwnerWatch", task.param.TaskId)
 		task.cancelOwnerWatch()
-		log.Debugf("[%s] task remove, call cancelParamWatch", task.param.TaskId)
-		task.cancelParamWatch()
-		log.Debugf("[%s] task remove, Del owner", task.param.TaskId)
+		if task.cancelParamWatch != nil {
+			log.Debugf("[%s] task remove, call cancelParamWatch", task.param.TaskId)
+			task.cancelParamWatch()
+		}
+		log.Debugf("[%s] task remove, delete owner", task.param.TaskId)
 		self.etcd.Del(self.itemKey(task.param.TaskId, "Owner"), false)
 		log.Infof("[%s] task remove complete", task.param.TaskId)
 	}(t)
@@ -202,35 +225,199 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 }
 
 func (self *TaskWorker) checkNewTasks() {
-	for taskType, queue := range self.taskQueue {
-		for task := queue.Front(); task != nil; {
+	updateResource := func() () {
+		if time.Now().Unix()-self.lastResourceUpdate < *self.config.ResourceUpdateInterval {
+			return
+		}
+		for resType, desc := range *self.config.ResourceTypes {
+			total, used, err := self.config.CbGetResourceInfo(self.config.InstanceHandle, resType)
+			if err != nil {
+				log.Errorf("[updateResource] CbGetResourceInfo [%d:%s] ret err:%v", resType, desc, err)
+				continue
+			}
+			res := self.resources[resType]
+			res.total = total
+			res.used = used
+			log.Debugf("[updateResource] [%d:%s] total:%d, used:%d", resType, desc, total, used)
+		}
+	}
+
+	doWaitResource := func(queue *_PriorityQueue, taskInfo *_TaskInfo) bool {
+		queue.mutex.Lock()
+		if queue.waitResource != nil {
+			log.Debugf("[WaitResource] [%s][%s] already have wait resource task, skip wait",
+				taskInfo.param.TaskId, taskInfo.param.TaskType, taskInfo.param.DispatchCount)
+			queue.mutex.Unlock()
+			return false
+		}
+		queue.mutex.Unlock()
+
+		key := self.itemKey(taskInfo.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
+		cmp := clientv3.Compare(clientv3.CreateRevision(key), "!=", 0)
+		opPut, _ := self.etcd.OpPut(key, "", 0)
+		resp, err := self.etcd.Txn([]clientv3.Cmp{cmp}, []clientv3.Op{*opPut}, nil)
+		if err != nil {
+			log.Errorf("[WaitResource] [%s] etcd.Txn got err:%v", taskInfo.param.TaskId, err)
+			return false
+		} else if !resp.Succeeded {
+			log.Errorf("[WaitResource] [%s] etcd.Txn response not succeed", taskInfo.param.TaskId)
+			self.etcd.Del(key, false)
+			return false
+		}
+
+		getOpts := append(clientv3.WithLastCreate(), clientv3.WithMaxCreateRev(resp.Header.Revision-1))
+		ctx, _ := context.WithTimeout(context.TODO(), *self.config.Etcd.DialTimeout*time.Second)
+		r, err := self.etcd.Client.Get(ctx, self.itemKey(taskInfo.param.TaskId, "WaitResource"), getOpts...)
+		if err == nil && len(r.Kvs) >= *self.config.MaxWaitResourceWorkers {
+			log.Infof("[WaitResource] [%s] already have %d worker wait", taskInfo.param.TaskId, len(r.Kvs))
+			self.etcd.Del(key, false)
+			return false
+		}
+		queue.mutex.Lock()
+		queue.waitResource = taskInfo
+		queue.mutex.Unlock()
+
+		// 起一个goroutine监控TaskParam, WaitResource的任务被删除时停止wait
+		on_delete := func(key string, val []byte) bool {
+			queue.mutex.Lock()
+			queue.waitResource = nil
+			queue.mutex.Unlock()
+			self.logJson(log.LevelInfo, log.Json{"cmd": "wait_resource_removed", "task_id": taskInfo.param.TaskId,
+				"task_type": taskInfo.param.TaskType, "reason": "TaskParam deleted"})
+			return true
+		}
+		ctxCancel, cancel := context.WithCancel(context.Background())
+		taskInfo.cancelParamWatch = cancel
+		go self.etcd.WatchCallback(key, "DELETE", false, on_delete, ctxCancel)
+
+		self.logJson(log.LevelInfo, log.Json{"cmd": "wait_resource_added",
+			"task_id": taskInfo.param.TaskId, "task_type": taskInfo.param.TaskType})
+		return true
+	}
+
+	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) bool {
+		taskInfo.resource = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
+		for resType, resInfo := range taskInfo.resource {
+			sysRes, ok := self.resources[resType]
+			if !ok {
+				log.Criticalf("CbGetTaskResources return an unknown resType [%d], bug in user code", resType)
+				return false
+			}
+
+			used := sysRes.used
+			for _, task := range self.taskProcessing {
+				if r, ok := task.resource[resType]; ok {
+					if time.Now().Unix() > task.status.StartTime+int64(r.AllocateTime) {
+						used += r.Reserve
+					} else {
+						used += r.Need
+					}
+				}
+			}
+
+			for _, priority := range self.priorities { // 按照priority从小到大遍历
+				if priority > taskPriority || priority == taskPriority && isWaitResourceTask {
+					break
+				}
+				queue := self.taskQueues[priority]
+				queue.mutex.Lock()
+				if queue.waitResource != nil {
+					if r, ok := queue.waitResource.resource[resType]; ok {
+						used += r.Need
+					}
+				}
+				queue.mutex.Unlock()
+			}
+
+			if used+resInfo.Need > sysRes.total {
+				return false
+			}
+		}
+		return true
+	}
+
+	updateResource()
+	for _, priority := range self.priorities { // 按照priority从小到大遍历
+		queue := self.taskQueues[priority]
+
+		queue.mutex.Lock()
+		waitResource := queue.waitResource
+		queue.mutex.Unlock()
+		if waitResource != nil {
+			if checkResource(waitResource, priority, true) {
+				key := self.itemKey(waitResource.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
+				self.etcd.Del(key, false)
+				waitResource.cancelParamWatch()
+				waitResource.cancelParamWatch = nil
+				queue.mutex.Lock()
+				queue.waitResource = nil
+				queue.mutex.Unlock()
+				startOk := false
+				if self.tryAddTask(waitResource) {
+					startOk = true
+				}
+				self.logJson(log.LevelInfo, log.Json{"cmd": "wait_resource_removed",
+					"task_id": waitResource.param.TaskId, "task_type": waitResource.param.TaskType,
+					"reason": "resource satisfied", "start_ok": startOk})
+			}
+		}
+
+		for task := queue.first.Front(); task != nil; {
 			t := task
 			task = task.Next()
 			taskInfo := t.Value.(*_TaskInfo)
-			if time.Now().Unix()-taskInfo.foundTime > *self.config.MaxQueueTime {
-				log.Debugf("[%s][%s] remove timeout from queue", taskInfo.param.TaskId, taskType)
-				queue.Remove(t)
+			queue.first.Remove(t)
+
+			if checkResource(taskInfo, priority, false) {
+				self.tryAddTask(taskInfo)
 			} else {
-				err := self.config.CbTaskAddCheck(&taskInfo.param)
-				if err == nil {
-					log.Debugf("[%s][%s] try take owner", taskInfo.param.TaskId, taskType)
-					if !self.tryAddTask(taskInfo) {
-						log.Debugf("[%s][%s] take owner FAILED! skip", taskInfo.param.TaskId, taskType)
-					}
-					queue.Remove(t)
-				} else if err == ErrNotSupport {
-					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], skip", taskInfo.param.TaskId, taskType, err.Error())
-					queue.Remove(t)
-				} else if err == ErrOutOfResource {
-					taskInfo.lastOORTime = time.Now().UnixNano()
-					log.Debugf("[%s][%s] CbTaskAddCheck ret [%s], pause check", taskInfo.param.TaskId, taskType, err.Error())
-					break
-				} else {
-					log.Criticalf("CbTaskAddCheck invalid return value [%v], client code error", err)
-					queue.Remove(t)
-				}
+				doWaitResource(queue, taskInfo)
 			}
 		}
+
+		for task := queue.second.Front(); task != nil; {
+			t := task
+			task = task.Next()
+			taskInfo := t.Value.(*_TaskInfo)
+			queue.second.Remove(t)
+
+			// 跳过在队列里过长时间的任务，很可能已被其它worker取走，即使未被取走manager也会重新分发
+			if time.Now().Unix()-taskInfo.foundTime > *self.config.MaxQueueTime {
+				log.Debugf("[%s][%s] remove timeout from queue", taskInfo.param.TaskId, taskInfo.param.TaskType)
+				continue
+			}
+
+			if checkResource(taskInfo, priority, false) {
+				self.tryAddTask(taskInfo)
+			}
+		}
+	}
+}
+
+func (self *TaskWorker) send2Queues(task *_TaskInfo) {
+	priority, exist := (*self.config.TaskTypes)[task.param.TaskType]
+	if !exist {
+		self.logJson(log.LevelInfo, log.Json{"cmd": "unknown_task", "task_id": task.param.TaskId,
+			"task_type": task.param.TaskType})
+		return
+	}
+
+	q := self.taskQueues[priority]
+	if task.param.DispatchCount > *self.config.DispatchThreshold {
+		// 按从大到小的顺序插入
+		inserted := false
+		for t := q.first.Front(); t != nil; t = t.Next() {
+			if task.param.DispatchCount > t.Value.(*_TaskInfo).param.DispatchCount {
+				q.first.InsertBefore(task, t)
+				inserted = true
+				break
+			}
+		}
+		if !inserted {
+			q.first.PushBack(task)
+		}
+	} else {
+		q.second.PushBack(task)
 	}
 }
 
@@ -271,8 +458,8 @@ func (self *FetchVisitor) Visit(key string, val []byte) bool {
 	task.foundTime = time.Now().Unix()
 	task.param.TaskId = secs[len(secs)-1]
 	task.param.TaskType = secs[len(secs)-2]
-	log.Infof("[%s] found new task, id [%s], type [%s]", self.caller, task.param.TaskId, task.param.TaskType)
-
+	log.Infof("[%s] found new task, id [%s], type [%s], dispatch count [%d]",
+		self.caller, task.param.TaskId, task.param.TaskType, task.param.DispatchCount)
 	self.chTask <- &task
 	return true
 }
@@ -281,7 +468,7 @@ func (self *TaskWorker) watchNewTask() {
 	visitor := FetchVisitor{}
 	visitor.caller = "watchNewTask"
 	visitor.chTask = self.chTask
-	for _, taskType := range *self.config.TaskTypes {
+	for taskType := range *self.config.TaskTypes {
 		go self.etcd.WatchVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, "PUT", true, &visitor, nil)
 	}
 }
@@ -292,7 +479,7 @@ func (self *TaskWorker) scanExistingTasks() {
 	visitor.chTask = self.chTask
 	visitor.opts = []clientv3.OpOption{}
 	visitor.opts = append(visitor.opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend))
-	for _, taskType := range *self.config.TaskTypes {
+	for taskType := range *self.config.TaskTypes {
 		go self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, &visitor, -1, nil)
 	}
 }
@@ -309,11 +496,22 @@ func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 	self.chTask = make(chan *_TaskInfo, 1000)
 	self.chRemove = make(chan *_TaskInfo, 1000)
 
-	self.taskQueue = make(map[string]*list.List)
-	for _, taskType := range *self.config.TaskTypes {
-		self.taskQueue[taskType] = list.New()
+	self.resources = make(map[int]*_ResourceInfo)
+	for resType, desc := range *config.ResourceTypes {
+		total, used, err := config.CbGetResourceInfo(config.InstanceHandle, resType)
+		log.Infof("new resource type [%d:%s]. total:%d, used:%d, err:%v", resType, desc, total, used, err)
+		self.resources[resType] = &_ResourceInfo{resType: resType, total: total, used: used}
 	}
+
 	self.taskProcessing = make(map[string]*_TaskInfo)
+
+	self.taskQueues = make(map[int]*_PriorityQueue)
+	self.priorities = make([]int, 0)
+	for _, priority := range *self.config.TaskTypes {
+		self.taskQueues[priority] = &_PriorityQueue{first: list.New(), second: list.New()}
+		self.priorities = append(self.priorities, priority)
+	}
+	sort.Ints(self.priorities)
 
 	log.Infof("Init OK")
 	return nil
@@ -327,7 +525,7 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 		for {
 			select {
 			case task := <-self.chTask:
-				self.taskQueue[task.param.TaskType].PushBack(task)
+				self.send2Queues(task)
 			case task := <-self.chRemove:
 				self.removeTask(task)
 			case <-tickChan:
@@ -355,7 +553,7 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 				case <-tickChan:
 					// mdp-manager每60s更新一次/KeepAlive
 					if time.Now().Unix()-lastUpdate > 60*5 {
-						self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
+						self.logJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
 							"now": time.Now().Unix(), "last_update": lastUpdate})
 						self.etcd.Exit()
 						os.Exit(0)
@@ -380,7 +578,7 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userPa
 	if status == TaskStatusComplete || status == TaskStatusError || status == TaskStatusRestart {
 		preTime := taskInfo.status.StartTime - param.AddTime
 		processingTime := time.Now().Unix() - taskInfo.status.StartTime
-		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
+		self.logJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": param.TaskId,
 			"pre_time": preTime, "processing_time": processingTime, "status_str": status,
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo

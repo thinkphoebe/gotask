@@ -133,7 +133,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 			}
 
 			log.Infof("[%s] wait %ds recover task, status:%v, retryCount:%d", taskId, waitTime, taskStatus, retryCount)
-			key := self.itemKey(taskId, "Wait")
+			key := self.itemKey(taskId, "WaitRecover")
 			val := logId
 			if err := self.etcd.Put(key, val, waitTime); err != nil {
 				self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
@@ -318,7 +318,7 @@ func (self *TaskManager) updateFetch() {
 
 		feedMax := int(*self.config.FetchMax - self.fetchCount[taskType])
 		for i := 0; i < feedMax; i++ {
-			log.Debugf("taskType:%s, queues:%d, feedMax:%d, i:%d", taskType, len(queues[taskType]), feedMax, i)
+			log.Debugf("taskType:%s, taskQueues:%d, feedMax:%d, i:%d", taskType, len(queues[taskType]), feedMax, i)
 			if len(queues[taskType]) == 0 {
 				feedCount := feedQueue(taskType)
 				log.Debugf("feedCount:%d", feedCount)
@@ -431,11 +431,35 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 		}
 	}
 
+	taskParam.DispatchCount += 1
+	paramBytes, _ = json.Marshal(taskParam)
+
 	log.Errorf("[%s] recover task", taskId)
 	key := self.itemKey(taskId, "Fetch/"+taskParam.TaskType)
-	if err := self.etcd.Put(key, string(paramBytes), *self.config.FetchTimeout); err != nil {
-		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId, "key": key,
-			"value": string(paramBytes), "ttl": 0})
+	opFetch, err := self.etcd.OpPut(key, string(paramBytes), *self.config.FetchTimeout)
+	if err != nil {
+		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
+			"ttl": self.config.FetchTimeout, "error": "moveTask self.etcd.OpPut got err:" + err.Error()})
+		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId,
+			"key": key, "value": string(paramBytes), "ttl": 0})
+		return false
+	}
+
+	opTaskParam, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
+	ifs := []clientv3.Op{*opTaskParam, *opFetch}
+	resp, err := self.etcd.Txn(nil, ifs, nil)
+	if err != nil || !resp.Succeeded {
+		if err != nil {
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+				"error": "recoverTask self.etcd.Txn got err:" + err.Error()})
+		}
+		if resp != nil && !resp.Succeeded {
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+				"error": "recoverTask self.etcd.Txn not Succeeded"})
+		}
+		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "task_lost", "task_id": taskId,
+			"key": key, "value": string(paramBytes), "ttl": 0})
+		return false
 	}
 
 	var statesBytes []byte
@@ -478,7 +502,7 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	opOwner := self.etcd.OpDel(self.itemKey(taskId, "Owner"), false)
 	opStatus := self.etcd.OpDel(self.itemKey(taskId, "Status"), false)
 	opErrorInfo := self.etcd.OpDel(self.itemKey(taskId, "ErrorInfo"), false)
-	opWait := self.etcd.OpDel(self.itemKey(taskId, "Wait"), false)
+	opWait := self.etcd.OpDel(self.itemKey(taskId, "WaitRecover"), false)
 	opDel, _ := self.etcd.OpPut(self.itemKey(taskId, "Deleted"), string(delBytes), 0)
 
 	ifs := []clientv3.Op{*opDel, *opInfo, *opQueue, *opProc, *opStatus, *opFetch, *opOwner, *opWait, *opErrorInfo}
@@ -640,7 +664,7 @@ func (self *TaskManager) StartMaster() {
 	log.Warnf("start to handle as master")
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Fetch/", "DELETE", true, self.onKeyFetchDelete, nil)
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Owner/", "DELETE", true, self.onKeyOwnerDelete, nil)
-	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Wait/", "DELETE", true, self.onKeyWaitDelete, nil)
+	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/WaitRecover/", "DELETE", true, self.onKeyWaitDelete, nil)
 
 	// 为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
 	log.Warnf("start recover...")
