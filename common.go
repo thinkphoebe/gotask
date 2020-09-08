@@ -27,6 +27,11 @@ type TaskManagerConfig struct {
 	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }
 
+type ResourceInfo struct {
+	Name    string `json:"name"`
+	Reserve int    `json:"reserve"`
+}
+
 type TaskResource struct {
 	Need         int // 预估任务需要的数量，准确或者比实际需要的大一些
 	AllocateTime int // 预计从任务启动到该资源分配完毕需要的时间，比实际需要的大一些
@@ -40,8 +45,8 @@ type TaskWorkerConfig struct {
 	// priority值越小，优先级越高
 	TaskTypes *map[string]int `json:"task_types"`
 
-	// 资源的类型，key: ResourceType, value: describe
-	ResourceTypes *map[int]string `json:"resource_types"`
+	// 资源的类型，key: resource name
+	Resources *map[string]*ResourceInfo `json:"resources"`
 
 	// 更新资源占用的最小时间间隔，单位：秒
 	ResourceUpdateInterval *int64 `json:"resource_update_interval"`
@@ -65,10 +70,13 @@ type TaskWorkerConfig struct {
 	// 在调用以下CbXxx函数时通过handle参数回传，用于回调函数区分对象实例
 	InstanceHandle interface{} `json:"-"`
 
-	CbGetResourceInfo func(handle interface{}, resType int) (total int, used int, err error) `json:"-"`
+	CbGetResourceInfo func(handle interface{}, resName string) (total int, used int, err error) `json:"-"`
 	// 获取任务预估需要占用的资源，仅根据任务参数给出一个安全值，避免非常耗时或block的资源检查
 	// key: resType，资源类型，如CPU、GPU、Codec等
-	CbGetTaskResources func(handle interface{}, param *TaskParam) map[int]*TaskResource `json:"-"`
+	CbGetTaskResources func(handle interface{}, param *TaskParam) map[string]*TaskResource `json:"-"`
+
+	// 是否允许添加任务
+	CbTaskAddCheck func(param *TaskParam) bool `json:"-"`
 
 	// TaskWorker获取任务成功后调用此回调。用户可在此回调中启动执行任务
 	// 返回nil表示任务添加成功

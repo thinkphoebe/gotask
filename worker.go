@@ -18,9 +18,9 @@ import (
 )
 
 type _ResourceInfo struct {
-	resType int
 	total   int
 	used    int
+	reserve int
 }
 
 type _PriorityQueue struct {
@@ -33,8 +33,9 @@ type _PriorityQueue struct {
 type _TaskInfo struct {
 	param            TaskParam
 	status           TaskStatus
-	resource         map[int]*TaskResource
+	resource         map[string]*TaskResource
 	foundTime        int64
+	startTime        int64 // 目前除了日志打印没有其它用途
 	rentTime         int64
 	leaseId          clientv3.LeaseID
 	cancelOwnerWatch context.CancelFunc
@@ -45,12 +46,13 @@ type _TaskInfo struct {
 type TaskWorker struct {
 	config TaskWorkerConfig
 
-	etcd     goetcd.Etcd
-	chTask   chan *_TaskInfo
-	chRemove chan *_TaskInfo
+	etcd      goetcd.Etcd
+	chTask    chan *_TaskInfo
+	chRemove  chan *_TaskInfo
+	stopFetch bool
 
 	lastResourceUpdate int64
-	resources          map[int]*_ResourceInfo // key: resource type
+	resources          map[string]*_ResourceInfo // key: resource name
 
 	// watch到的任务队列，key: priority
 	taskQueues map[int]*_PriorityQueue
@@ -154,6 +156,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 
 	// 起一个goroutine做keepalive
 	task.leaseId = resp.ID
+	task.startTime = time.Now().Unix()
 	task.rentTime = time.Now().Unix()
 	go func() {
 		log.Infof("[%s] start keepalive...", task.param.TaskId)
@@ -226,19 +229,23 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 
 func (self *TaskWorker) checkNewTasks() {
 	updateResource := func() () {
+		if self.config.Resources == nil || self.config.ResourceUpdateInterval == nil ||
+				*self.config.ResourceUpdateInterval <= 0 || self.config.CbGetResourceInfo == nil {
+			return
+		}
 		if time.Now().Unix()-self.lastResourceUpdate < *self.config.ResourceUpdateInterval {
 			return
 		}
-		for resType, desc := range *self.config.ResourceTypes {
-			total, used, err := self.config.CbGetResourceInfo(self.config.InstanceHandle, resType)
+		for _, info := range *self.config.Resources {
+			total, used, err := self.config.CbGetResourceInfo(self.config.InstanceHandle, info.Name)
 			if err != nil {
-				log.Errorf("[updateResource] CbGetResourceInfo [%d:%s] ret err:%v", resType, desc, err)
+				log.Errorf("[updateResource] CbGetResourceInfo [%s] ret err:%v", info.Name, err)
 				continue
 			}
-			res := self.resources[resType]
+			res := self.resources[info.Name]
 			res.total = total
 			res.used = used
-			log.Debugf("[updateResource] [%d:%s] total:%d, used:%d", resType, desc, total, used)
+			log.Debugf("[updateResource] [%s] total:%d, used:%d", info.Name, total, used)
 		}
 	}
 
@@ -296,6 +303,12 @@ func (self *TaskWorker) checkNewTasks() {
 	}
 
 	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) bool {
+		if self.config.CbTaskAddCheck != nil && !self.config.CbTaskAddCheck(&taskInfo.param) {
+			return false
+		}
+		if self.config.CbGetTaskResources == nil {
+			return true
+		}
 		taskInfo.resource = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
 		for resType, resInfo := range taskInfo.resource {
 			sysRes, ok := self.resources[resType]
@@ -329,7 +342,7 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.mutex.Unlock()
 			}
 
-			if used+resInfo.Need > sysRes.total {
+			if used+resInfo.Need > sysRes.total-sysRes.reserve {
 				return false
 			}
 		}
@@ -496,11 +509,13 @@ func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 	self.chTask = make(chan *_TaskInfo, 1000)
 	self.chRemove = make(chan *_TaskInfo, 1000)
 
-	self.resources = make(map[int]*_ResourceInfo)
-	for resType, desc := range *config.ResourceTypes {
-		total, used, err := config.CbGetResourceInfo(config.InstanceHandle, resType)
-		log.Infof("new resource type [%d:%s]. total:%d, used:%d, err:%v", resType, desc, total, used, err)
-		self.resources[resType] = &_ResourceInfo{resType: resType, total: total, used: used}
+	self.resources = make(map[string]*_ResourceInfo)
+	if config.Resources != nil && config.CbGetResourceInfo != nil {
+		for name, info := range *config.Resources {
+			total, used, err := config.CbGetResourceInfo(config.InstanceHandle, name)
+			log.Infof("new resource type [%s]. total:%d, used:%d, err:%v", name, total, used, err)
+			self.resources[name] = &_ResourceInfo{total: total, used: used, reserve: info.Reserve}
+		}
 	}
 
 	self.taskProcessing = make(map[string]*_TaskInfo)
@@ -518,54 +533,74 @@ func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 }
 
 func (self *TaskWorker) Start(exitKeepAliveFail bool) {
-	go func() {
+	printStatus := func() {
+		self.mutex.Lock()
+		log.Infof("stop fetch:%v, tasks in processing:%d", self.stopFetch, len(self.taskProcessing))
+		for id, info := range self.taskProcessing {
+			log.Debugf("[%s] type:%v, status:%v, time cost:%ds", id, info.param.TaskType,
+				info.status, time.Now().Unix()-info.startTime)
+		}
+		self.mutex.Unlock()
+	}
+
+	runProcess := func() {
 		self.watchNewTask()
 		self.scanExistingTasks()
-		tickChan := time.NewTicker(time.Millisecond * 100).C
+		tickCheckNew := time.NewTicker(time.Millisecond * 100).C
+		tickPrint := time.NewTicker(time.Second * 60).C
 		for {
 			select {
 			case task := <-self.chTask:
-				self.send2Queues(task)
+				if self.stopFetch {
+					self.send2Queues(task)
+				} else {
+					log.Debugf("[%s] fetch stopped, discard", task.param.TaskId)
+				}
 			case task := <-self.chRemove:
 				self.removeTask(task)
-			case <-tickChan:
+			case <-tickCheckNew:
 				self.checkNewTasks()
+			case <-tickPrint:
+				printStatus()
 			}
 		}
-	}()
-
-	if exitKeepAliveFail {
-		go func() {
-			ch := make(chan string, 100)
-			onKeepAlive := func(key string, val []byte) bool {
-				msg := string(val)
-				ch <- msg
-				return true
-			}
-			go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/KeepAlive", "PUT", true, onKeepAlive, nil)
-
-			tickChan := time.NewTicker(time.Second * 60).C
-			lastUpdate := time.Now().Unix()
-			for {
-				select {
-				case <-ch:
-					lastUpdate = time.Now().Unix()
-				case <-tickChan:
-					// mdp-manager每60s更新一次/KeepAlive
-					if time.Now().Unix()-lastUpdate > 60*5 {
-						self.logJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
-							"now": time.Now().Unix(), "last_update": lastUpdate})
-						self.etcd.Exit()
-						os.Exit(0)
-					}
-				}
-			}
-		}()
 	}
 
+	keepAlive := func() {
+		ch := make(chan string, 100)
+		onKeepAlive := func(key string, val []byte) bool {
+			msg := string(val)
+			ch <- msg
+			return true
+		}
+		go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/KeepAlive", "PUT", true, onKeepAlive, nil)
+
+		tickChan := time.NewTicker(time.Second * 60).C
+		lastUpdate := time.Now().Unix()
+		for {
+			select {
+			case <-ch:
+				lastUpdate = time.Now().Unix()
+			case <-tickChan:
+				// mdp-manager每60s更新一次/KeepAlive
+				if time.Now().Unix()-lastUpdate > 60*5 {
+					self.logJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
+						"now": time.Now().Unix(), "last_update": lastUpdate})
+					self.etcd.Exit()
+					os.Exit(0)
+				}
+			}
+		}
+	}
+
+	go runProcess()
+	if exitKeepAliveFail {
+		go keepAlive()
+	}
 	log.Infof("Start OK")
 }
 
+// 更新任务状态，TaskStatusComplete、TaskStatusError、TaskStatusRestart时child应结束当前任务的执行
 func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userParam []byte) {
 	self.mutex.Lock()
 	taskInfo, ok := self.taskProcessing[param.TaskId]
@@ -583,4 +618,9 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userPa
 			"reason": "status error or complete", "status": fmt.Sprintf("%#v", taskInfo.status)})
 		self.chRemove <- taskInfo
 	}
+}
+
+// 停止取新任务，已获取的任务继续执行。升级时部署新的节点并对旧的节点StopFetch，待旧节点任务都处理结束后再删掉
+func (self *TaskWorker) StopFetch() {
+	self.stopFetch = true
 }
