@@ -70,10 +70,10 @@ type TaskWorkerConfig struct {
 	// 在调用以下CbXxx函数时通过handle参数回传，用于回调函数区分对象实例
 	InstanceHandle interface{} `json:"-"`
 
-	CbGetResourceInfo func(handle interface{}, resName string) (total int, used int, err error) `json:"-"`
+	CbGetResourceInfo func(handle interface{}, resName string) (total, used int, err error) `json:"-"`
 	// 获取任务预估需要占用的资源，仅根据任务参数给出一个安全值，避免非常耗时或block的资源检查
 	// key: resType，资源类型，如CPU、GPU、Codec等
-	CbGetTaskResources func(handle interface{}, param *TaskParam) map[string]*TaskResource `json:"-"`
+	CbGetTaskResources func(handle interface{}, param *TaskParam) (map[string]*TaskResource, error) `json:"-"`
 
 	// 是否允许添加任务
 	CbTaskAddCheck func(param *TaskParam) bool `json:"-"`

@@ -123,7 +123,6 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	on_delete := func(key string, val []byte) bool {
 		self.logJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
 			"reason": "owner key deleted", "status": fmt.Sprintf("%#v", task.status)})
-		self.config.CbTaskStop(self.config.InstanceHandle, &task.param)
 		self.chRemove <- task
 		return true
 	}
@@ -245,7 +244,8 @@ func (self *TaskWorker) checkNewTasks() {
 			res := self.resources[info.Name]
 			res.total = total
 			res.used = used
-			log.Debugf("[updateResource] [%s] total:%d, used:%d", info.Name, total, used)
+			log.Debugf("[updateResource] [%s] total:%d, reserve:%d, used:%d",
+				info.Name, total, info.Reserve, used)
 		}
 	}
 
@@ -303,13 +303,17 @@ func (self *TaskWorker) checkNewTasks() {
 	}
 
 	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) bool {
+		var err error
 		if self.config.CbTaskAddCheck != nil && !self.config.CbTaskAddCheck(&taskInfo.param) {
 			return false
 		}
 		if self.config.CbGetTaskResources == nil {
 			return true
 		}
-		taskInfo.resource = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
+		taskInfo.resource, err = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
+		if err != nil {
+			return false
+		}
 		for resType, resInfo := range taskInfo.resource {
 			sysRes, ok := self.resources[resType]
 			if !ok {
@@ -513,7 +517,7 @@ func (self *TaskWorker) Init(config *TaskWorkerConfig) error {
 	if config.Resources != nil && config.CbGetResourceInfo != nil {
 		for name, info := range *config.Resources {
 			total, used, err := config.CbGetResourceInfo(config.InstanceHandle, name)
-			log.Infof("new resource type [%s]. total:%d, used:%d, err:%v", name, total, used, err)
+			log.Infof("new resource type [%s]. used:%d, err:%v", name, used, err)
 			self.resources[name] = &_ResourceInfo{total: total, used: used, reserve: info.Reserve}
 		}
 	}
