@@ -731,10 +731,10 @@ func (self *TaskManager) Remove(taskId string) error {
 }
 
 // 本函数主要用于清理误添加的任务的情况，一般不应调用
-// 安全起见，userId、taskType不能为空
+// 安全起见，userId不能为空
 func (self *TaskManager) Clean(userId, taskType string) error {
-	if userId == "" || taskType == "" {
-		return errors.New(fmt.Sprintf("userId [%s] and taskType [%s] should not be empty", userId, taskType))
+	if userId == "" {
+		return errors.New(fmt.Sprintf("userId [%s] should not be empty", userId))
 	}
 
 	on_task := func(key string, val []byte) bool {
@@ -744,7 +744,7 @@ func (self *TaskManager) Clean(userId, taskType string) error {
 			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, val)
 			return true
 		}
-		if taskParam.UserId != userId || taskParam.TaskType != taskType {
+		if taskParam.UserId != userId || taskType != "" && taskParam.TaskType != taskType {
 			return true
 		}
 		self.removeTask(taskId, "delete_clean")
