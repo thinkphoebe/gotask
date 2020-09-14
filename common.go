@@ -98,9 +98,9 @@ type TaskParam struct {
 	TaskId        string `json:"taskId,omitempty"`
 	TaskType      string `json:"taskType,omitempty"`
 	UserId        string `json:"userId,omitempty"`
-	Retry         int    `json:"retry,omitempty"`          // 0：不重试，+n：重试次数，-1：无限重试
-	AddTime       int64  `json:"add_time,omitempty"`       // 任务的添加时间，unix second
-	DispatchCount int    `json:"dispatch_count,omitempty"` // 已被重新分发的次数
+	Retry         int    `json:"retry,omitempty"`         // 0：不重试，+n：重试次数，-1：无限重试
+	AddTime       int64  `json:"addTime,omitempty"`       // 任务的添加时间，unix second
+	DispatchCount int    `json:"dispatchCount,omitempty"` // 已被重新分发的次数
 	UserParam     []byte `json:"userParam,omitempty"`
 }
 
@@ -120,6 +120,14 @@ type DeletedInfo struct {
 	TaskParam  []byte `json:"taskParam,omitempty"`
 	TaskStatus []byte `json:"taskStatus,omitempty"`
 	ErrorInfo  []byte `json:"errorInfo,omitempty"`
+}
+
+type TaskInfo struct {
+	TaskId     string
+	TaskParam  *TaskParam
+	TaskStatus *TaskStatus
+	RetryCount int
+	DeleteTime int64
 }
 
 var (

@@ -77,7 +77,7 @@ func (self *TaskManager) readEtcdJson(taskId string, key string, value_out *[]by
 	}
 	if object_out != nil {
 		if err := json.Unmarshal(vals[0], &object_out); err != nil {
-			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, readed value [%s]", taskId, err, key, vals[0])
+			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, vals[0])
 			return err
 		}
 	}
@@ -739,10 +739,9 @@ func (self *TaskManager) Clean(userId, taskType string) error {
 
 	on_task := func(key string, val []byte) bool {
 		var taskParam TaskParam
-		var paramBytes []byte
 		taskId := getKeyEnd(key)
-		if self.readEtcdJson(taskId, key, &paramBytes, &taskParam) != nil {
-			log.Errorf("[%s] read TaskParam FAILED, task may be deleted", taskId)
+		if err := json.Unmarshal(val, &taskParam); err != nil {
+			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, val)
 			return true
 		}
 		if taskParam.UserId != userId || taskParam.TaskType != taskType {
@@ -794,12 +793,73 @@ func (self *TaskManager) Modify(taskId string, userParam []byte) error {
 	return nil
 }
 
-func (self *TaskManager) Query(taskId string) error {
-	// TODO
-	return nil
+func (self *TaskManager) Query(taskId string) (*TaskInfo, error) {
+	var taskStatus TaskStatus
+	var errInfo ErrorInfo
+	var delInfo DeletedInfo
+	ti := &TaskInfo{TaskId: taskId}
+	taskParam := &TaskParam{}
+
+	if err := self.readEtcdJson(taskId, self.itemKey(taskId, "TaskParam"), nil, &taskParam); err == nil {
+		if self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), nil, &taskStatus) != nil {
+			taskStatus.Status = "waiting"
+		}
+		if err := self.readEtcdJson(taskId, self.itemKey(taskId, "ErrorInfo"), nil, &errInfo); err == nil {
+			ti.RetryCount = errInfo.RetryCount
+		}
+	} else {
+		log.Infof("[%s], no TaskParam, try read Deleted info", taskId)
+		if err := self.readEtcdJson(taskId, self.itemKey(taskId, "Deleted"), nil, &delInfo); err != nil {
+			log.Infof("[%s] no TaskParam and no Deleted info", taskId)
+			return nil, err
+		} else {
+			if err := json.Unmarshal(delInfo.TaskParam, &taskParam); err != nil {
+				log.Infof("[%s] json.Unmarshal delInfo.TaskParam got err:%v, value [%s]", taskId, err, delInfo.TaskParam)
+				return nil, err
+			}
+			if err := json.Unmarshal(delInfo.TaskStatus, &taskStatus); err != nil {
+				log.Infof("[%s] json.Unmarshal delInfo.TaskStatus got err:%v, value [%s]", taskId, err, delInfo.TaskStatus)
+				return nil, err
+			}
+			if err := json.Unmarshal(delInfo.ErrorInfo, &errInfo); err == nil {
+				log.Debugf("[%s] json.Unmarshal delInfo.ErrorInfo got err:%v, value [%s]", taskId, err, delInfo.ErrorInfo)
+				ti.RetryCount = errInfo.RetryCount
+			}
+			ti.DeleteTime = delInfo.DeleteTime
+		}
+	}
+
+	ti.TaskParam = taskParam
+	ti.TaskStatus = &taskStatus
+	return ti, nil
 }
 
-func (self *TaskManager) List() error {
-	// TODO
-	return nil
+func (self *TaskManager) List(userId string, taskType string, needDetail bool) ([]*TaskInfo, error) {
+	tis := make([]*TaskInfo, 0)
+	on_task := func(key string, val []byte) bool {
+		var taskParam TaskParam
+		taskId := getKeyEnd(key)
+		if err := json.Unmarshal(val, &taskParam); err != nil {
+			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, val)
+			return true
+		}
+		if userId != "" && userId != taskParam.UserId || taskId != "" && taskType != taskParam.TaskType {
+			return true
+		}
+		var ti *TaskInfo
+		var err error
+		if needDetail {
+			ti, err = self.Query(taskId)
+		} else {
+			ti = &TaskInfo{TaskId: taskId, TaskParam: &taskParam}
+		}
+		if err == nil {
+			tis = append(tis, ti)
+		} else {
+			log.Errorf("[%s] readTask got err:%v, skip", taskId, err)
+		}
+		return true
+	}
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", on_task, -1, nil)
+	return tis, nil
 }
