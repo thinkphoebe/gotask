@@ -235,6 +235,7 @@ func (self *TaskWorker) checkNewTasks() {
 		if time.Now().Unix()-self.lastResourceUpdate < *self.config.ResourceUpdateInterval {
 			return
 		}
+		self.lastResourceUpdate = time.Now().Unix()
 		for _, info := range *self.config.Resources {
 			total, used, err := self.config.CbGetResourceInfo(self.config.InstanceHandle, info.Name)
 			if err != nil {
