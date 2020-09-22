@@ -843,7 +843,7 @@ func (self *TaskManager) List(userId string, taskType string, needDetail bool) (
 			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, val)
 			return true
 		}
-		if userId != "" && userId != taskParam.UserId || taskId != "" && taskType != taskParam.TaskType {
+		if userId != "" && userId != taskParam.UserId || taskType != "" && taskType != taskParam.TaskType {
 			return true
 		}
 		var ti *TaskInfo
