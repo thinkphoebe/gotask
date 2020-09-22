@@ -227,9 +227,9 @@ func (self *TaskWorker) removeTask(task *_TaskInfo) bool {
 }
 
 func (self *TaskWorker) checkNewTasks() {
-	updateResource := func() () {
+	updateResource := func() {
 		if self.config.Resources == nil || self.config.ResourceUpdateInterval == nil ||
-				*self.config.ResourceUpdateInterval <= 0 || self.config.CbGetResourceInfo == nil {
+			*self.config.ResourceUpdateInterval <= 0 || self.config.CbGetResourceInfo == nil {
 			return
 		}
 		if time.Now().Unix()-self.lastResourceUpdate < *self.config.ResourceUpdateInterval {
@@ -556,7 +556,7 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 		for {
 			select {
 			case task := <-self.chTask:
-				if self.stopFetch {
+				if !self.stopFetch {
 					self.send2Queues(task)
 				} else {
 					log.Debugf("[%s] fetch stopped, discard", task.param.TaskId)
