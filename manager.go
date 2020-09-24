@@ -834,9 +834,11 @@ func (self *TaskManager) Query(taskId string) (*TaskInfo, error) {
 	return ti, nil
 }
 
-func (self *TaskManager) List(userId string, taskType string, needDetail bool) ([]*TaskInfo, error) {
+// recentDeleted参数值大于0时，包括删除时间在recentDeleted秒内的任务
+func (self *TaskManager) List(userId string, taskType string, needDetail bool, recentDeleted int64) ([]*TaskInfo, error) {
 	tis := make([]*TaskInfo, 0)
-	on_task := func(key string, val []byte) bool {
+
+	onTask := func(key string, val []byte) bool {
 		var taskParam TaskParam
 		taskId := getKeyEnd(key)
 		if err := json.Unmarshal(val, &taskParam); err != nil {
@@ -860,6 +862,53 @@ func (self *TaskManager) List(userId string, taskType string, needDetail bool) (
 		}
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", on_task, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", onTask, -1, nil)
+
+	if recentDeleted <= 0 {
+		return tis, nil
+	}
+
+	onDeleted := func(key string, val []byte) bool {
+		var delInfo DeletedInfo
+		var taskParam TaskParam
+		var ti *TaskInfo
+		taskId := getKeyEnd(key)
+
+		err := json.Unmarshal(val, &delInfo)
+		if err != nil {
+			log.Errorf("parse delInfo FAILED! delete key. key [%s], err [%s]", key, err.Error())
+			if _, err := self.etcd.Del(key, false); err != nil {
+				self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_del", "key": key, "error": err.Error()})
+			}
+			return true
+		}
+
+		if time.Now().Unix()-delInfo.DeleteTime > recentDeleted {
+			return false
+		}
+
+		if err := json.Unmarshal(delInfo.TaskParam, &taskParam); err != nil {
+			log.Infof("[%s] json.Unmarshal got err:%v, key:%s, value [%s]", taskId, err, key, val)
+			return true
+		}
+		if userId != "" && userId != taskParam.UserId || taskType != "" && taskType != taskParam.TaskType {
+			return true
+		}
+
+		if needDetail {
+			ti, err = self.Query(taskId)
+		} else {
+			ti = &TaskInfo{TaskId: taskId, TaskParam: &taskParam}
+		}
+		if err == nil {
+			tis = append(tis, ti)
+		} else {
+			log.Errorf("[%s] readTask got err:%v, skip", taskId, err)
+		}
+		return true
+	}
+	opts := []clientv3.OpOption{}
+	opts = append(opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortDescend))
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Deleted/", onDeleted, -1, opts)
 	return tis, nil
 }
