@@ -33,17 +33,17 @@ type TaskManager struct {
 	inited          bool
 	master          bool
 
-	//保存各个userId
+	// 保存各个userId
 	usersMap map[string]int64
 
-	//保存各个taskType
+	// 保存各个taskType
 	taskTypesMap map[string]int64
-	//为避免多线程读写将修改值发送到此chan统一修改
+	// 为避免多线程读写将修改值发送到此chan统一修改
 	chTaskTypesUpdate chan string
 
-	//从该chan读取到数据时更新fetch，值为GFetchCount需要更新的差值
+	// 从该chan读取到数据时更新fetch，值为GFetchCount需要更新的差值
 	chFetchUpdate chan _FetchInfo
-	//记录fetch节点的数量
+	// 记录fetch节点的数量
 	fetchCount map[string]int64
 }
 
@@ -107,7 +107,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 	var taskStatus TaskStatus
 	err := self.readEtcdJson(taskId, self.itemKey(taskId, "Status"), nil, &taskStatus)
 	if err == nil && taskStatus.Status == TaskStatusComplete {
-		//任务正常结束
+		// 任务正常结束
 		log.Infof("[%s] remove complete task, status:%v, retryCount:%d", taskId, taskStatus, retryCount)
 		self.removeTask(taskId, "delete_complete")
 	} else {
@@ -140,7 +140,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 					"value": logId, "ttl": waitTime})
 			}
 		} else {
-			//删除出错任务
+			// 删除出错任务
 			log.Infof("[%s] remove error task, status:%v, retryCount:%d", taskId, taskStatus, int(retryCount))
 			self.removeTask(taskId, "delete_error")
 		}
@@ -182,7 +182,7 @@ func (self *TaskManager) initUsers() {
 		log.Infof("find user [%s]", user)
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Users/", onUser, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Users/", onUser, -1, 0, nil)
 
 	onTaskType := func(key string, val []byte) bool {
 		taskType := getKeyEnd(key)
@@ -190,7 +190,7 @@ func (self *TaskManager) initUsers() {
 		log.Infof("find taskType [%s]", taskType)
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskTypes/", onTaskType, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskTypes/", onTaskType, -1, 0, nil)
 }
 
 func (self *TaskManager) watchQueue() {
@@ -296,7 +296,8 @@ func (self *TaskManager) updateFetch() {
 				log.Debugf("feed [%s] to queue", key)
 				return true
 			}
-			self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Queue/"+taskType+"/"+userId, addQueue, *self.config.FetchBatch, nil)
+			self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Queue/"+taskType+"/"+userId,
+				addQueue, *self.config.FetchBatch, 0, nil)
 		}
 		return total
 	}
@@ -515,7 +516,13 @@ func (self *TaskManager) recoverCallback(key string, val []byte) bool {
 	return true
 }
 
-func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
+type DeletedVisitor struct {
+	config  *TaskManagerConfig
+	etcd    *goetcd.Etcd
+	Stopped bool
+}
+
+func (self *DeletedVisitor) Visit(key string, val []byte) bool {
 	var delInfo DeletedInfo
 	err := json.Unmarshal(val, &delInfo)
 	if err != nil {
@@ -527,6 +534,7 @@ func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
 	}
 	if time.Now().Unix()-delInfo.DeleteTime < *self.config.DeletedKeep {
 		log.Infof("key [%s] deleteTime [%v], now [%v], stop clean", key, delInfo.DeleteTime, time.Now().Unix())
+		self.Stopped = true
 		return false
 	}
 
@@ -609,7 +617,7 @@ func (self *TaskManager) Exit() error {
 	log.Infof("Exit...")
 	if self.inited {
 		if self.electionSession != nil {
-			self.electionSession.Close() //使slave立即election succeed提供服务
+			self.electionSession.Close() // 使slave立即election succeed提供服务
 		}
 		self.etcd.Exit()
 		os.Exit(0)
@@ -641,19 +649,31 @@ func (self *TaskManager) StartMaster() {
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Owner/", "DELETE", true, self.onKeyOwnerDelete, nil)
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Wait/", "DELETE", true, self.onKeyWaitDelete, nil)
 
-	//为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
+	// 为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
 	log.Warnf("start recover...")
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Processing/", self.recoverCallback, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Processing/", self.recoverCallback, -1, 0, nil)
 	log.Warnf("recover completed")
 
-	//定期清理${task_root}/deleted中过期的key
+	// 定期清理${task_root}/deleted中过期的key
 	for {
 		log.Warnf("start deleted clean...")
 		opts := []clientv3.OpOption{}
 		opts = append(opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend))
-		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Deleted/", self.deletedCleanCallback, -1, opts)
+		v := DeletedVisitor{
+			config:  &self.config,
+			etcd:    &self.etcd,
+			Stopped: false,
+		}
+		for !v.Stopped {
+			self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Deleted/", &v, 500, 0, opts)
+			count, err := self.etcd.Count(*self.config.Etcd.KeyPrefix + "/Deleted/")
+			if err != nil || count < 100 {
+				break
+			}
+		}
+
 		log.Warnf("start status clean...")
-		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Status/", self.statusCleanCallback, -1, opts)
+		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Status/", self.statusCleanCallback, -1, 500, nil)
 		log.Warnf("clean completed")
 		time.Sleep(time.Second * 3600)
 	}
@@ -706,11 +726,11 @@ func (self *TaskManager) Remove(taskId string) error {
 }
 
 func (self *TaskManager) Query(taskId string) error {
-	//TODO
+	// TODO
 	return nil
 }
 
 func (self *TaskManager) List() error {
-	//TODO
+	// TODO
 	return nil
 }

@@ -222,7 +222,6 @@ func (self *TaskWorker) updateStatusValue(task *_TaskInfo, status string, userPa
 
 type FetchVisitor struct {
 	caller string
-	opts   []clientv3.OpOption
 	chTask chan *_TaskInfo
 }
 
@@ -262,10 +261,8 @@ func (self *TaskWorker) scanExistingTasks() {
 	visitor := FetchVisitor{}
 	visitor.caller = "scanExistingTasks"
 	visitor.chTask = self.chTask
-	visitor.opts = []clientv3.OpOption{}
-	visitor.opts = append(visitor.opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend))
 	for _, taskType := range *self.config.TaskTypes {
-		go self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, &visitor, -1, nil)
+		go self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Fetch/"+taskType, &visitor, -1, 500, nil)
 	}
 }
 
