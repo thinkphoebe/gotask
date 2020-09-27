@@ -182,7 +182,7 @@ func (self *TaskManager) initUsers() {
 		log.Infof("find user [%s]", user)
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Users/", onUser, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Users/", onUser, -1, 0, nil)
 
 	onTaskType := func(key string, val []byte) bool {
 		taskType := getKeyEnd(key)
@@ -190,7 +190,7 @@ func (self *TaskManager) initUsers() {
 		log.Infof("find taskType [%s]", taskType)
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskTypes/", onTaskType, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskTypes/", onTaskType, -1, 0, nil)
 }
 
 func (self *TaskManager) watchQueue() {
@@ -297,7 +297,8 @@ func (self *TaskManager) updateFetch() {
 				log.Debugf("feed [%s] to queue", key)
 				return true
 			}
-			self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Queue/"+taskType+"/"+userId, addQueue, *self.config.FetchBatch, nil)
+			self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Queue/"+taskType+"/"+userId,
+				addQueue, *self.config.FetchBatch, 0, nil)
 		}
 		return total
 	}
@@ -540,7 +541,13 @@ func (self *TaskManager) recoverCallback(key string, val []byte) bool {
 	return true
 }
 
-func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
+type DeletedVisitor struct {
+	config  *TaskManagerConfig
+	etcd    *goetcd.Etcd
+	Stopped bool
+}
+
+func (self *DeletedVisitor) Visit(key string, val []byte) bool {
 	var delInfo DeletedInfo
 	err := json.Unmarshal(val, &delInfo)
 	if err != nil {
@@ -552,6 +559,7 @@ func (self *TaskManager) deletedCleanCallback(key string, val []byte) bool {
 	}
 	if time.Now().Unix()-delInfo.DeleteTime < *self.config.DeletedKeep {
 		log.Infof("key [%s] deleteTime [%v], now [%v], stop clean", key, delInfo.DeleteTime, time.Now().Unix())
+		self.Stopped = true
 		return false
 	}
 
@@ -668,7 +676,7 @@ func (self *TaskManager) StartMaster() {
 
 	// 为了防止master切换期间有fetch timer超时没有watch导致超时没有取的任务一直没有重新下发，这里扫描一遍
 	log.Warnf("start recover...")
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Processing/", self.recoverCallback, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Processing/", self.recoverCallback, -1, 0, nil)
 	log.Warnf("recover completed")
 
 	// 定期清理${task_root}/deleted中过期的key
@@ -676,9 +684,21 @@ func (self *TaskManager) StartMaster() {
 		log.Warnf("start deleted clean...")
 		opts := []clientv3.OpOption{}
 		opts = append(opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortAscend))
-		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Deleted/", self.deletedCleanCallback, -1, opts)
+		v := DeletedVisitor{
+			config:  &self.config,
+			etcd:    &self.etcd,
+			Stopped: false,
+		}
+		for !v.Stopped {
+			self.etcd.WalkVisitor(*self.config.Etcd.KeyPrefix+"/Deleted/", &v, 500, 0, opts)
+			count, err := self.etcd.Count(*self.config.Etcd.KeyPrefix + "/Deleted/")
+			if err != nil || count < 100 {
+				break
+			}
+		}
+
 		log.Warnf("start status clean...")
-		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Status/", self.statusCleanCallback, -1, opts)
+		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Status/", self.statusCleanCallback, -1, 500, nil)
 		log.Warnf("clean completed")
 		time.Sleep(time.Second * 3600)
 	}
@@ -750,7 +770,7 @@ func (self *TaskManager) Clean(userId, taskType string) error {
 		self.removeTask(taskId, "delete_clean")
 		return true
 	}
-	return self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", on_task, -1, nil)
+	return self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", on_task, -1, 500, nil)
 }
 
 func (self *TaskManager) Modify(taskId string, userParam []byte) error {
@@ -862,7 +882,7 @@ func (self *TaskManager) List(userId string, taskType string, needDetail bool, r
 		}
 		return true
 	}
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", onTask, -1, nil)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskParam/", onTask, -1, 0, nil)
 
 	if recentDeleted <= 0 {
 		return tis, nil
@@ -909,6 +929,6 @@ func (self *TaskManager) List(userId string, taskType string, needDetail bool, r
 	}
 	opts := []clientv3.OpOption{}
 	opts = append(opts, clientv3.WithSort(clientv3.SortByModRevision, clientv3.SortDescend))
-	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Deleted/", onDeleted, -1, opts)
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/Deleted/", onDeleted, 10000, 0, opts)
 	return tis, nil
 }
