@@ -17,6 +17,12 @@ import (
 	log "github.com/thinkphoebe/golog"
 )
 
+// 任务处理流程：visitor -> chTask -> send2Queues -> checkNewTasks -> tryAddTask
+// priority值越小，优先级越高
+// 假设一个WaitResourceTask的priority值为a，处理时优先级介于a-1和a之间，或认为排在相同priority的任务之前
+
+// WaitResource不利于资源充分利用，因为Wait的任务一般需要大块资源，而为Wait任务保留但还不满足Wait任务执行的资源无法被其它任务使用
+
 type _ResourceInfo struct {
 	total   int
 	used    int
@@ -253,8 +259,8 @@ func (self *TaskWorker) checkNewTasks() {
 	doWaitResource := func(queue *_PriorityQueue, taskInfo *_TaskInfo) bool {
 		queue.mutex.Lock()
 		if queue.waitResource != nil {
-			log.Debugf("[WaitResource] [%s][%s] already have wait resource task, skip wait",
-				taskInfo.param.TaskId, taskInfo.param.TaskType, taskInfo.param.DispatchCount)
+			log.Debugf("[WaitResource] [%s][%s] already have wait resource task [%s], skip wait",
+				taskInfo.param.TaskId, taskInfo.param.TaskType, queue.waitResource.param.TaskId)
 			queue.mutex.Unlock()
 			return false
 		}
@@ -277,7 +283,7 @@ func (self *TaskWorker) checkNewTasks() {
 		ctx, _ := context.WithTimeout(context.TODO(), *self.config.Etcd.DialTimeout*time.Second)
 		r, err := self.etcd.Client.Get(ctx, self.itemKey(taskInfo.param.TaskId, "WaitResource"), getOpts...)
 		if err == nil && len(r.Kvs) >= *self.config.MaxWaitResourceWorkers {
-			log.Infof("[WaitResource] [%s] already have %d worker wait", taskInfo.param.TaskId, len(r.Kvs))
+			log.Infof("[WaitResource] [%s] already have %d waiting workers", taskInfo.param.TaskId, len(r.Kvs))
 			self.etcd.Del(key, false)
 			return false
 		}
@@ -306,33 +312,44 @@ func (self *TaskWorker) checkNewTasks() {
 	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) bool {
 		var err error
 		if self.config.CbTaskAddCheck != nil && !self.config.CbTaskAddCheck(&taskInfo.param) {
+			log.Debugf("[checkResource][%s] config.CbTaskAddCheck ret false", taskInfo.param.TaskId)
 			return false
 		}
 		if self.config.CbGetTaskResources == nil {
+			log.Debugf("[checkResource][%s] config.CbGetTaskResources is nil, ret true", taskInfo.param.TaskId)
 			return true
 		}
 		taskInfo.resource, err = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
 		if err != nil {
+			log.Debugf("[checkResource][%s] config.CbGetTaskResources got err [%v], ret false",
+				taskInfo.param.TaskId, err)
 			return false
 		}
 		for resType, resInfo := range taskInfo.resource {
 			sysRes, ok := self.resources[resType]
 			if !ok {
-				log.Criticalf("CbGetTaskResources return an unknown resType [%d], bug in user code", resType)
+				log.Criticalf("[checkResource][%s] CbGetTaskResources return an unknown resType [%d], bug in user code, ret false",
+					taskInfo.param.TaskId, resType)
 				return false
 			}
 
-			used := sysRes.used
+			// 所有处理中任务占用的资源
+			usedProc := 0
 			for _, task := range self.taskProcessing {
 				if r, ok := task.resource[resType]; ok {
 					if time.Now().Unix() > task.status.StartTime+int64(r.AllocateTime) {
-						used += r.Reserve
+						usedProc += r.Reserve
 					} else {
-						used += r.Need
+						usedProc += r.Need
 					}
 				}
 			}
 
+			// 所有已在队列中且优先级更高的任务需要的资源
+			// 普通任务将同优先级的任务计算进去，因为普通任务优先级相同时应先到先处理
+			// WaitResourceTask不包括同优先级任务，因为WaitResourceTask会在同优先级任务之前处理
+			// 由于以下总是按priority从小到达遍历，实际上usedQueue应该永远为0？
+			usedQueue := 0
 			for _, priority := range self.priorities { // 按照priority从小到大遍历
 				if priority > taskPriority || priority == taskPriority && isWaitResourceTask {
 					break
@@ -341,16 +358,20 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.mutex.Lock()
 				if queue.waitResource != nil {
 					if r, ok := queue.waitResource.resource[resType]; ok {
-						used += r.Need
+						usedQueue += r.Need
 					}
 				}
 				queue.mutex.Unlock()
 			}
 
-			if used+resInfo.Need > sysRes.total-sysRes.reserve {
+			log.Debugf("[checkResource][%s] resType [%s], sys total:%d, sys reserve:%d, sys used:%d, processing used:%d, queue need:%d, task need:%d",
+				taskInfo.param.TaskId, resType, sysRes.total, sysRes.reserve, sysRes.used, usedProc, usedQueue, resInfo.Need)
+			if sysRes.used+usedProc+usedQueue+resInfo.Need > sysRes.total-sysRes.reserve {
+				log.Debugf("[checkResource][%s] resource not enough, ret false", taskInfo.param.TaskId)
 				return false
 			}
 		}
+		log.Debugf("[checkResource][%s] all resource ok, return true", taskInfo.param.TaskId)
 		return true
 	}
 
@@ -362,7 +383,9 @@ func (self *TaskWorker) checkNewTasks() {
 		waitResource := queue.waitResource
 		queue.mutex.Unlock()
 		if waitResource != nil {
+			log.Debugf("priority [%d] has waitResourceTask, check first", priority)
 			if checkResource(waitResource, priority, true) {
+				log.Debugf("[%s] waitResourceTask have resource now, try to add", waitResource.param.TaskId)
 				key := self.itemKey(waitResource.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
 				self.etcd.Del(key, false)
 				waitResource.cancelParamWatch()
@@ -387,8 +410,10 @@ func (self *TaskWorker) checkNewTasks() {
 			queue.first.Remove(t)
 
 			if checkResource(taskInfo, priority, false) {
+				log.Debugf("[%s] checkResource from first queue ok, try to add", taskInfo.param.TaskId)
 				self.tryAddTask(taskInfo)
 			} else {
+				log.Debugf("[%s] checkResource from first queue FAILED! set to wait resource", taskInfo.param.TaskId)
 				doWaitResource(queue, taskInfo)
 			}
 		}
@@ -406,7 +431,10 @@ func (self *TaskWorker) checkNewTasks() {
 			}
 
 			if checkResource(taskInfo, priority, false) {
+				log.Debugf("[%s] checkResource from second queue ok, try to add", taskInfo.param.TaskId)
 				self.tryAddTask(taskInfo)
+			} else {
+				log.Debugf("[%s] checkResource from second queue FAILED, skip", taskInfo.param.TaskId)
 			}
 		}
 	}
@@ -424,17 +452,22 @@ func (self *TaskWorker) send2Queues(task *_TaskInfo) {
 	if task.param.DispatchCount > *self.config.DispatchThreshold {
 		// 按从大到小的顺序插入
 		inserted := false
+		pos := 0
 		for t := q.first.Front(); t != nil; t = t.Next() {
 			if task.param.DispatchCount > t.Value.(*_TaskInfo).param.DispatchCount {
+				log.Debugf("[%s] insert to first queue, pos:%d", task.param.TaskId, pos)
 				q.first.InsertBefore(task, t)
 				inserted = true
 				break
 			}
+			pos++
 		}
 		if !inserted {
+			log.Debugf("[%s] put to end of first queue, pos:%d", task.param.TaskId, pos)
 			q.first.PushBack(task)
 		}
 	} else {
+		log.Debugf("[%s] put to second queue, pos:%d", task.param.TaskId, q.second.Len())
 		q.second.PushBack(task)
 	}
 }
