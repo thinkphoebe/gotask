@@ -1,6 +1,7 @@
 package gotask
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
@@ -11,7 +12,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
@@ -41,6 +44,10 @@ type TaskManager struct {
 	// 为避免多线程读写将修改值发送到此chan统一修改
 	chTaskTypesUpdate chan string
 
+	// 保存各个resType
+	resTypesMap map[string]int64
+	mutexResMap sync.Mutex
+
 	// 从该chan读取到数据时更新fetch，值为GFetchCount需要更新的差值
 	chFetchUpdate chan _FetchInfo
 	// 记录fetch节点的数量
@@ -65,6 +72,12 @@ func genTaskId() string {
 	h.Write([]byte(base64.URLEncoding.EncodeToString(b)))
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+type FailedResourceTasks []*FailedResourceInfo
+
+func (s FailedResourceTasks) Len() int           { return len(s) }
+func (s FailedResourceTasks) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s FailedResourceTasks) Less(i, j int) bool { return s[i].SucceedTaskCount < s[j].SucceedTaskCount }
 
 func (self *TaskManager) readEtcdJson(taskId string, key string, value_out *[]byte, object_out interface{}) error {
 	vals, err := self.etcd.Get(key, false)
@@ -191,6 +204,14 @@ func (self *TaskManager) initUsers() {
 		return true
 	}
 	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/TaskTypes/", onTaskType, -1, 0, nil)
+
+	onResourceType := func(key string, val []byte) bool {
+		resType := getKeyEnd(key)
+		self.resTypesMap[resType] = time.Now().Unix()
+		log.Infof("find resType [%s]", resType)
+		return true
+	}
+	self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/ResourceTypes/", onResourceType, -1, 0, nil)
 }
 
 func (self *TaskManager) watchQueue() {
@@ -408,6 +429,135 @@ func (self *TaskManager) updateFetch() {
 	}
 }
 
+func (self *TaskManager) updateTaskResource() {
+	on_put := func(key string, val []byte) bool {
+		var workerRes = WorkerResourceCheck{}
+		err := json.Unmarshal(val, &workerRes)
+		if err != nil {
+			log.Errorf("parse WorkerResourceCheck FAILED! key [%s], val [%s], err [%s]", key, string(val), err.Error())
+			self.etcd.Del(key, false)
+			return true
+		}
+
+		for resType, succeed := range workerRes.ResourceDetails {
+			self.mutexResMap.Lock()
+			newResType := false
+			if _, ok := self.resTypesMap[resType]; !ok {
+				self.resTypesMap[resType] = time.Now().Unix()
+				newResType = true
+			}
+			self.mutexResMap.Unlock()
+			if newResType {
+				self.etcd.Put(*self.config.Etcd.KeyPrefix+"/ResourceTypes/"+resType, "", 0)
+			}
+
+			k := *self.config.Etcd.KeyPrefix + "/FailedResource/" + resType + "/" + workerRes.TaskId
+			if workerRes.Succeed || succeed {
+				// 任务检测成功或某个资源检测成功时删除/FailedResource/{ResourceType}/{TaskId}
+				self.etcd.Del(k, false)
+			} else {
+				// 某个资源检测失败时如果/FailedResource/{ResourceType}/{TaskId}不存在则创建并记录FailStartTime
+				checkInfo := FailedResourceInfo{
+					TaskId:        workerRes.TaskId,
+					AddTime:       workerRes.AddTime,
+					FailStartTime: time.Now().Unix(),
+				}
+				paramBytes, _ := json.Marshal(checkInfo)
+				opInfo, _ := self.etcd.OpPut(k, string(paramBytes), 0)
+
+				ifs := []clientv3.Op{*opInfo}
+				cmpParam := clientv3.Compare(clientv3.CreateRevision(k), "==", 0)
+				resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, nil)
+				if err != nil {
+					self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": workerRes.TaskId,
+						"error": "etcd.Txn got err:" + err.Error()})
+				} else if !resp.Succeeded {
+					self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": workerRes.TaskId,
+						"error": "etcd.Txn resp not Succeeded, should not go here"})
+				}
+			}
+
+			if workerRes.Succeed {
+				// 任务资源检测成功时扫描/FailedResource/{ResourceType}，更新各个资源检测失败任务的SucceedTaskCount
+				callback := func(key string, val []byte) bool {
+					checkInfo := FailedResourceInfo{}
+					err := json.Unmarshal(val, &checkInfo)
+					if err == nil {
+						log.Errorf("FailedResource update, json.Unmarshal FAILED! k[%s], v[%s]", key, string(val))
+						return true
+					}
+					if workerRes.AddTime < checkInfo.AddTime {
+						log.Debugf("FailedResource update, task [%s] AddTime [%d] > succeed task [%d], skip",
+							checkInfo.TaskId, checkInfo.AddTime, workerRes.AddTime)
+						return true
+					}
+					checkInfo.SucceedTaskCount++
+					paramBytes, _ := json.Marshal(checkInfo)
+					self.etcd.Put(key, string(paramBytes), 0)
+					log.Debugf("FailedResource update, update task [%s] SucceedTaskCount to %d",
+						checkInfo.TaskId, checkInfo.SucceedTaskCount)
+					return true
+				}
+				keyPrefix := *self.config.Etcd.KeyPrefix + "/FailedResource/" + resType + "/"
+				opts := []clientv3.OpOption{clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend)}
+				self.etcd.WalkCallback(keyPrefix, callback, -1, 0, opts)
+			}
+		}
+
+		self.etcd.Del(key, false)
+		return true
+	}
+	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/WorkerResourceCheck/", "PUT", true, on_put, nil)
+
+	checkWaitResource := func(resType string) {
+		var tis FailedResourceTasks
+		callback := func(key string, val []byte) bool {
+			info := FailedResourceInfo{}
+			err := json.Unmarshal(val, &info)
+			if err == nil {
+				log.Errorf("callback, json.Unmarshal FAILED! k[%s], v[%s]", key, string(val))
+				return true
+			}
+			tis = append(tis, &info)
+			return true
+		}
+		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/FailedResource/"+resType+"/",
+			callback, -1, 0, nil)
+
+		sort.Sort(sort.Reverse(tis))
+
+		for i := 0; i < len(tis) && i < int(*self.config.MaxWaitResource); i++ {
+			ti := tis[i]
+			if ti.SucceedTaskCount > *self.config.WaitResourceThreshold {
+				cbModify := func(taskParam *TaskParam) bool {
+					if taskParam.WaitResource == 0 {
+						taskParam.WaitResource = 1
+						return true
+					}
+					log.Debugf("[%s][%s] task already in wait resource status, [%#v]", ti.TaskId, resType, ti)
+					return false
+				}
+				if err := self.modifyTask(ti.TaskId, cbModify); err != nil {
+					log.Errorf("[%s][%s] set task to wait resource status got err [%v], [%#v]",
+						ti.TaskId, resType, err, ti)
+				} else {
+					log.Infof("[%s][%s] set task to wait resource status, [%#v]", ti.TaskId, resType, ti)
+				}
+			}
+		}
+	}
+
+	ticker := time.NewTicker(time.Second * 300)
+	for {
+		select {
+		case <-ticker.C:
+			for resType := range self.resTypesMap {
+				checkWaitResource(resType)
+			}
+		}
+	}
+}
+
 func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool) bool {
 	var taskParam TaskParam
 	var paramBytes []byte
@@ -519,6 +669,17 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 		return errors.New("etcd.Txn resp not Succeeded")
 	}
 
+	// 删除Resource相关的key
+	keys := make([]string, 0)
+	self.mutexResMap.Lock()
+	for resType := range self.resTypesMap {
+		keys = append(keys, *self.config.Etcd.KeyPrefix+"/FailedResource/"+resType+"/"+taskParam.TaskId)
+	}
+	self.mutexResMap.Unlock()
+	for _, key := range keys {
+		self.etcd.Del(key, false)
+	}
+
 	// 出错删除时记录任务参数以便重做任务
 	param := "ommit"
 	if logId == "delete_error" {
@@ -530,6 +691,67 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 		"task_type": taskParam.TaskType, "task_status": taskStatus, "task_param": param,
 		"pre_time": preTime, "processing_time": processingTime, "retry_count": errInfo.RetryCount})
 	return nil
+}
+
+// 为了避免多线程同时修改任务信息，这里读取、修改、写入的步骤，写入时检测ModRevision，如果已经发生变化则不写入并重复以上步骤重新读取任务信息
+func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *TaskParam) bool) error {
+	for i := 0; i < 1000; i++ {
+		key := self.itemKey(taskId, "TaskParam")
+		op := self.etcd.OpGet(key, false)
+		ctx, cancel := context.WithTimeout(context.TODO(), *self.config.Etcd.DialTimeout*time.Second)
+		respGet, err := self.etcd.Client.Do(ctx, *op)
+		if cancel != nil {
+			cancel()
+		}
+		if err != nil || len(respGet.Get().Kvs) == 0 {
+			log.Errorf("[%s] Get TaskParam got err [%s][%v] or len(Kvs) == 0", taskId, key, err)
+			return errors.New("read TaskParam FAILED")
+		}
+
+		var taskParam TaskParam
+		err = json.Unmarshal(respGet.Get().Kvs[0].Value, &taskParam)
+		if err != nil {
+			log.Errorf("[%s] json.Unmarshal TaskParam got err:%v", taskId, err)
+			return errors.New("json.Unmarshal TaskParam got err:" + err.Error())
+		}
+
+		if !cbModify(&taskParam) {
+			log.Debugf("[%s] canceled modify in callback", taskId)
+			return nil
+		}
+
+		var paramBytes []byte
+		paramBytes, _ = json.Marshal(taskParam)
+		cmpParam := clientv3.Compare(clientv3.ModRevision(self.itemKey(taskId, "TaskParam")),
+			"==", respGet.Get().Kvs[0].ModRevision)
+		opTaskParam, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
+		opProc, _ := self.etcd.OpPut(self.itemKey(taskId, "Processing"), string(paramBytes), 0)
+		// ATTENTION 修改任务会导致刷新Fetch key
+		opFetch, err := self.etcd.OpPut(self.itemKey(taskId, "Fetch/"+taskParam.TaskType),
+			string(paramBytes), *self.config.FetchTimeout)
+		if err != nil {
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
+				"ttl": self.config.FetchTimeout, "error": "modifyTask self.etcd.OpPut got err:" + err.Error()})
+			return errors.New("etcd_grant got err:%s" + err.Error())
+		}
+
+		ifs := []clientv3.Op{*opTaskParam, *opProc, *opFetch}
+		elses := []clientv3.Op{*opTaskParam}
+		resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, elses)
+		if err != nil {
+			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
+				"error": "modifyTask self.etcd.Txn got err:" + err.Error()})
+			return errors.New("etcd_txn got err:%s" + err.Error())
+		}
+		if resp.Succeeded {
+			log.Debugf("[%s] modify succeed, try times:%d", taskId, i)
+			break
+		} else {
+			log.Infof("[%s] modify FAILED! task may be modified by others, try times:%d", taskId, i)
+		}
+	}
+
+	return errors.New("try too many times")
 }
 
 func (self *TaskManager) recoverCallback(key string, val []byte) bool {
@@ -605,10 +827,11 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 	}
 
 	self.config = *config
-	self.chTaskTypesUpdate = make(chan string, 10)
+	self.chTaskTypesUpdate = make(chan string, 100)
 	self.chFetchUpdate = make(chan _FetchInfo, 100)
 	self.usersMap = make(map[string]int64)
 	self.taskTypesMap = make(map[string]int64)
+	self.resTypesMap = make(map[string]int64)
 	self.fetchCount = make(map[string]int64)
 	self.inited = true
 
@@ -661,13 +884,11 @@ func (self *TaskManager) StartMaster() {
 		self.Exit()
 	}(self.electionSession.Done())
 
-	self.usersMap = make(map[string]int64)
-	self.chFetchUpdate = make(chan _FetchInfo, 100)
-	self.fetchCount = make(map[string]int64)
 	self.watchQueue()
 	self.initUsers()
 	self.watchFetch()
 	go self.updateFetch()
+	go self.updateTaskResource()
 
 	log.Warnf("start to handle as master")
 	go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/Fetch/", "DELETE", true, self.onKeyFetchDelete, nil)
@@ -774,43 +995,11 @@ func (self *TaskManager) Clean(userId, taskType string) error {
 }
 
 func (self *TaskManager) Modify(taskId string, userParam []byte) error {
-	var key = self.itemKey(taskId, "TaskParam")
-	var taskParam TaskParam
-	var paramBytes []byte
-	if self.readEtcdJson(taskId, key, &paramBytes, &taskParam) != nil {
-		log.Errorf("[%s] read TaskParam FAILED, task may be deleted", taskId)
-		return errors.New("task not exist")
+	cbModify := func(taskParam *TaskParam) bool {
+		taskParam.UserParam = userParam
+		return true
 	}
-
-	taskParam.UserParam = userParam
-	paramBytes, _ = json.Marshal(taskParam)
-
-	cmpParam := clientv3.Compare(clientv3.CreateRevision(self.itemKey(taskId, "Processing")), "!=", 0)
-	opTaskParam, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
-	opProc, _ := self.etcd.OpPut(self.itemKey(taskId, "Processing"), string(paramBytes), 0)
-	// ATTENTION 修改任务会导致刷新Fetch key
-	opFetch, err := self.etcd.OpPut(self.itemKey(taskId, "Fetch/"+taskParam.TaskType), string(paramBytes), *self.config.FetchTimeout)
-	if err != nil {
-		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_grant", "task_id": taskId,
-			"ttl": self.config.FetchTimeout, "error": "moveTask self.etcd.OpPut got err:" + err.Error()})
-		return errors.New("etcd_grant got err:%s" + err.Error())
-	}
-
-	ifs := []clientv3.Op{*opTaskParam, *opProc, *opFetch}
-	elses := []clientv3.Op{*opTaskParam}
-	resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, elses)
-	if err != nil {
-		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
-			"error": "modifyTask self.etcd.Txn got err:" + err.Error()})
-		return errors.New("etcd_txn got err:%s" + err.Error())
-	}
-	if !resp.Succeeded {
-		self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
-			"error": "modifyTask self.etcd.Txn not Succeeded"})
-		return errors.New("etcd.Txn not Succeeded")
-	}
-
-	return nil
+	return self.modifyTask(taskId, cbModify)
 }
 
 func (self *TaskManager) Query(taskId string) (*TaskInfo, error) {

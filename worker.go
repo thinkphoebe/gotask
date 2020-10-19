@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -309,28 +310,32 @@ func (self *TaskWorker) checkNewTasks() {
 		return true
 	}
 
-	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) bool {
+	checkResource := func(taskInfo *_TaskInfo, taskPriority int, isWaitResourceTask bool) (bool, map[string]bool) {
 		var err error
+		var checkInfo = make(map[string]bool)
+		var succeed = true
+
 		if self.config.CbTaskAddCheck != nil && !self.config.CbTaskAddCheck(&taskInfo.param) {
 			log.Debugf("[checkResource][%s] config.CbTaskAddCheck ret false", taskInfo.param.TaskId)
-			return false
+			return false, checkInfo
 		}
 		if self.config.CbGetTaskResources == nil {
 			log.Debugf("[checkResource][%s] config.CbGetTaskResources is nil, ret true", taskInfo.param.TaskId)
-			return true
+			return true, checkInfo
 		}
 		taskInfo.resource, err = self.config.CbGetTaskResources(self.config.InstanceHandle, &taskInfo.param)
 		if err != nil {
 			log.Debugf("[checkResource][%s] config.CbGetTaskResources got err [%v], ret false",
 				taskInfo.param.TaskId, err)
-			return false
+			return false, checkInfo
 		}
+
 		for resType, resInfo := range taskInfo.resource {
 			sysRes, ok := self.resources[resType]
 			if !ok {
 				log.Criticalf("[checkResource][%s] CbGetTaskResources return an unknown resType [%d], bug in user code, ret false",
 					taskInfo.param.TaskId, resType)
-				return false
+				return false, checkInfo
 			}
 
 			// 所有处理中任务占用的资源
@@ -368,11 +373,26 @@ func (self *TaskWorker) checkNewTasks() {
 				taskInfo.param.TaskId, resType, sysRes.total, sysRes.reserve, sysRes.used, usedProc, usedQueue, resInfo.Need)
 			if sysRes.used+usedProc+usedQueue+resInfo.Need > sysRes.total-sysRes.reserve {
 				log.Debugf("[checkResource][%s] resource not enough, ret false", taskInfo.param.TaskId)
-				return false
+				succeed = false
+				checkInfo[resType] = false
+			} else {
+				checkInfo[resType] = true
 			}
 		}
 		log.Debugf("[checkResource][%s] all resource ok, return true", taskInfo.param.TaskId)
-		return true
+		return succeed, checkInfo
+	}
+
+	writeResourceInfo := func(taskInfo *_TaskInfo, succeed bool, checkInfo map[string]bool) {
+		resInfo := WorkerResourceCheck{
+			TaskId:          taskInfo.param.TaskId,
+			AddTime:         taskInfo.param.AddTime,
+			ResourceDetails: checkInfo,
+			Succeed:         succeed,
+		}
+		paramBytes, _ := json.Marshal(resInfo)
+		keyInfo := *self.config.Etcd.KeyPrefix + "/WorkerResourceCheck/" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		self.etcd.Put(keyInfo, string(paramBytes), 3600)
 	}
 
 	updateResource()
@@ -384,7 +404,8 @@ func (self *TaskWorker) checkNewTasks() {
 		queue.mutex.Unlock()
 		if waitResource != nil {
 			log.Debugf("priority [%d] has waitResourceTask, check first", priority)
-			if checkResource(waitResource, priority, true) {
+			succeed, checkInfo := checkResource(waitResource, priority, true)
+			if succeed {
 				log.Debugf("[%s] waitResourceTask have resource now, try to add", waitResource.param.TaskId)
 				key := self.itemKey(waitResource.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
 				self.etcd.Del(key, false)
@@ -395,11 +416,15 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.mutex.Unlock()
 				startOk := false
 				if self.tryAddTask(waitResource) {
+					writeResourceInfo(waitResource, succeed, checkInfo)
 					startOk = true
 				}
 				self.logJson(log.LevelInfo, log.Json{"cmd": "wait_resource_removed",
 					"task_id": waitResource.param.TaskId, "task_type": waitResource.param.TaskType,
 					"reason": "resource satisfied", "start_ok": startOk})
+			} else {
+				log.Debugf("[%s] wait resource task checkResource FAILED!", waitResource.param.TaskId)
+				writeResourceInfo(waitResource, succeed, checkInfo)
 			}
 		}
 
@@ -409,12 +434,20 @@ func (self *TaskWorker) checkNewTasks() {
 			taskInfo := t.Value.(*_TaskInfo)
 			queue.first.Remove(t)
 
-			if checkResource(taskInfo, priority, false) {
+			succeed, checkInfo := checkResource(taskInfo, priority, false)
+			if succeed {
 				log.Debugf("[%s] checkResource from first queue ok, try to add", taskInfo.param.TaskId)
-				self.tryAddTask(taskInfo)
+				if self.tryAddTask(taskInfo) {
+					// checkResource成功时，只有tryAddTask成功的才写，便于统计SucceedTaskCount
+					writeResourceInfo(taskInfo, succeed, checkInfo)
+				}
 			} else {
-				log.Debugf("[%s] checkResource from first queue FAILED! set to wait resource", taskInfo.param.TaskId)
-				doWaitResource(queue, taskInfo)
+				log.Debugf("[%s] checkResource from first queue FAILED! wait resource:%p",
+					taskInfo.param.TaskId, taskInfo.param.WaitResource)
+				if taskInfo.param.WaitResource != 0 {
+					doWaitResource(queue, taskInfo)
+				}
+				writeResourceInfo(taskInfo, succeed, checkInfo)
 			}
 		}
 
@@ -430,11 +463,15 @@ func (self *TaskWorker) checkNewTasks() {
 				continue
 			}
 
-			if checkResource(taskInfo, priority, false) {
+			succeed, checkInfo := checkResource(taskInfo, priority, false)
+			if succeed {
 				log.Debugf("[%s] checkResource from second queue ok, try to add", taskInfo.param.TaskId)
-				self.tryAddTask(taskInfo)
+				if self.tryAddTask(taskInfo) {
+					writeResourceInfo(taskInfo, succeed, checkInfo)
+				}
 			} else {
 				log.Debugf("[%s] checkResource from second queue FAILED, skip", taskInfo.param.TaskId)
+				writeResourceInfo(taskInfo, succeed, checkInfo)
 			}
 		}
 	}
