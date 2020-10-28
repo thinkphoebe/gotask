@@ -80,14 +80,14 @@ package gotask
 
 # 三种资源管理模式
 1. 完全由TaskWorker管理
-	* TaskWorkerConfig设置Resources、ResourceUpdateInterval、CbGetResourceInfo、CbGetTaskResources为有效值
-	* CbTaskAddCheck设置为nil或固定返回true
+    * TaskWorkerConfig设置Resources、ResourceUpdateInterval、CbGetResourceInfo、CbGetTaskResources为有效值
+    * CbTaskAddCheck设置为nil或固定返回true
 2. 完全由Child管理
-	* TaskWorkerConfig设置CbGetResourceInfo、CbGetTaskResources为nil
-	* CbTaskAddCheck设置为非nil，并根据是否允许添加任务返回true或false
+    * TaskWorkerConfig设置CbGetResourceInfo、CbGetTaskResources为nil
+    * CbTaskAddCheck设置为非nil，并根据是否允许添加任务返回true或false
 3. TaskWorker和Child共同管理
-	* TaskWorkerConfig设置Resources、ResourceUpdateInterval、CbGetResourceInfo、CbGetTaskResources为有效值
-	* CbTaskAddCheck设置为非nil，并根据是否允许添加任务返回true或false
-	* TaskWorker根据CbGetResourceInfo、CbGetTaskResources等信息检查满足资源需求，且CbTaskAddCheck返回true时尝试获取任务
+    * TaskWorkerConfig设置Resources、ResourceUpdateInterval、CbGetResourceInfo、CbGetTaskResources为有效值
+    * CbTaskAddCheck设置为非nil，并根据是否允许添加任务返回true或false
+    * TaskWorker根据CbGetResourceInfo、CbGetTaskResources等信息检查满足资源需求，且CbTaskAddCheck返回true时尝试获取任务
 
 */

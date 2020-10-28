@@ -371,7 +371,7 @@ func (self *TaskWorker) checkNewTasks() {
 
 			log.Debugf("[checkResource][%s] resType [%s], sys total:%d, sys reserve:%d, sys used:%d, processing used:%d, queue need:%d, task need:%d",
 				taskInfo.param.TaskId, resType, sysRes.total, sysRes.reserve, sysRes.used, usedProc, usedQueue, resInfo.Need)
-			if sysRes.used+usedProc+usedQueue+resInfo.Need > sysRes.total-sysRes.reserve {
+			if usedProc+usedQueue+resInfo.Need > sysRes.total-sysRes.used-sysRes.reserve {
 				log.Debugf("[checkResource][%s] resource not enough, ret false", taskInfo.param.TaskId)
 				succeed = false
 				checkInfo[resType] = false
@@ -416,7 +416,7 @@ func (self *TaskWorker) checkNewTasks() {
 				queue.mutex.Unlock()
 				startOk := false
 				if self.tryAddTask(waitResource) {
-					writeResourceInfo(waitResource, succeed, checkInfo)
+					// WaitResource的任务获取资源成功时不写ResourceInfo
 					startOk = true
 				}
 				self.logJson(log.LevelInfo, log.Json{"cmd": "wait_resource_removed",
@@ -638,36 +638,14 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 		}
 	}
 
-	keepAlive := func() {
-		ch := make(chan string, 100)
-		onKeepAlive := func(key string, val []byte) bool {
-			msg := string(val)
-			ch <- msg
-			return true
-		}
-		go self.etcd.WatchCallback(*self.config.Etcd.KeyPrefix+"/KeepAlive", "PUT", true, onKeepAlive, nil)
-
-		tickChan := time.NewTicker(time.Second * 60).C
-		lastUpdate := time.Now().Unix()
-		for {
-			select {
-			case <-ch:
-				lastUpdate = time.Now().Unix()
-			case <-tickChan:
-				// mdp-manager每60s更新一次/KeepAlive
-				if time.Now().Unix()-lastUpdate > 60*5 {
-					self.logJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed",
-						"now": time.Now().Unix(), "last_update": lastUpdate})
-					self.etcd.Exit()
-					os.Exit(0)
-				}
-			}
-		}
-	}
-
 	go runProcess()
 	if exitKeepAliveFail {
-		go keepAlive()
+		self.etcd.StartKeepalive(*self.config.Etcd.KeyPrefix+"/KeepAlive/Worker-"+self.config.InstanceId, 60, 5,
+			func() {
+				self.logJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed"})
+				self.etcd.Exit()
+				os.Exit(0)
+			})
 	}
 	log.Infof("Start OK")
 }

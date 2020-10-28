@@ -23,8 +23,13 @@ type TaskManagerConfig struct {
 	FetchBatch   *int64     `json:"fetch_batch"`
 	FetchTimeout *int64     `json:"fetch_timeout"`
 
+	// 某一个resource最多有多少个任务可以进入WaitResource状态
 	MaxWaitResource       *int64 `json:"max_wait_resource"`
+	// SucceedTaskCount > WaitResourceThreshold的任务可以进入WaitResource状态
 	WaitResourceThreshold *int64 `json:"wait_resource_threshold"`
+
+	// 用来区分manager的实例，用于生成KeepAlive的key
+	InstanceId string `json:"-"`
 
 	// TaskManager有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
 	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
@@ -67,7 +72,7 @@ type TaskWorkerConfig struct {
 	// 考虑到网络延迟等因素需要留出一些富余，如在TaskOwnTime过去 2/3时调用，但也不必过于频繁
 	TaskOwnTime *int64 `json:"task_own_time"`
 
-	// 该值目的是用来区分client的实例，会写入key Owner的value中，目前没有实际用途
+	// 用来区分worker的实例，会写入key Owner的value中，用于生成KeepAlive的key
 	InstanceId string `json:"-"`
 
 	// 在调用以下CbXxx函数时通过handle参数回传，用于回调函数区分对象实例
@@ -98,37 +103,37 @@ type TaskWorkerConfig struct {
 }
 
 type TaskParam struct {
-	TaskId        string `json:"task_id,omitempty"`
-	TaskType      string `json:"task_type,omitempty"`
-	UserId        string `json:"user_id,omitempty"`
-	Retry         int    `json:"retry,omitempty"`          // 0：不重试，+n：重试次数，-1：无限重试
-	AddTime       int64  `json:"add_time,omitempty"`       // 任务的添加时间，unix second
-	DispatchCount int    `json:"dispatch_count,omitempty"` // 已被重新分发的次数
-	WaitResource  int    `json:"wait_resource,omitempty"`  // 0：不wait，1：wait
-	UserParam     []byte `json:"user_param,omitempty"`
+	TaskId        string `json:"taskId,omitempty"`
+	TaskType      string `json:"taskType,omitempty"`
+	UserId        string `json:"userId,omitempty"`
+	Retry         int    `json:"retry,omitempty"`         // 0：不重试，+n：重试次数，-1：无限重试
+	AddTime       int64  `json:"addTime,omitempty"`       // 任务的添加时间，unix second
+	DispatchCount int    `json:"dispatchCount,omitempty"` // 已被重新分发的次数
+	WaitResource  int    `json:"waitResource,omitempty"`  // 0：不wait，1：wait
+	UserParam     []byte `json:"userParam,omitempty"`
 }
 
 type TaskStatus struct {
 	Status     string `json:"status,omitempty"`
-	StartTime  int64  `json:"start_time,omitempty"`
-	UpdateTime int64  `json:"update_time,omitempty"`
-	UserParam  []byte `json:"user_param,omitempty"`
+	StartTime  int64  `json:"startTime,omitempty"`
+	UpdateTime int64  `json:"updateTime,omitempty"`
+	UserParam  []byte `json:"userParam,omitempty"`
 }
 
 type WorkerResourceCheck struct {
-	TaskId  string `json:"task_id"`
-	AddTime int64  `json:"add_time"`
+	TaskId  string `json:"taskId"`
+	AddTime int64  `json:"addTime"`
 	// 具体某项资源检测是否成功
-	ResourceDetails map[string]bool `json:"resource_details"`
+	ResourceDetails map[string]bool `json:"resourceDetails"`
 	// 整个任务资源检测是否成功，成功需要ResourceDetails均成功且CbTaskAddCheck为nil或返回true
 	Succeed bool `json:"succeed"`
 }
 
 type FailedResourceInfo struct {
-	TaskId           string `json:"task_id"`
-	AddTime          int64  `json:"add_time"`
-	FailStartTime    int64  `json:"fail_start_time"`
-	SucceedTaskCount int64  `json:"succeed_task_count"` // FailStartTime之后成功获取该资源并执行的其它任务数
+	TaskId           string `json:"taskId"`
+	AddTime          int64  `json:"addTime"`
+	FailStartTime    int64  `json:"failStartTime"`
+	SucceedTaskCount int64  `json:"succeedTaskCount"` // FailStartTime之后成功获取该资源并执行的其它任务数
 }
 
 type ErrorInfo struct {

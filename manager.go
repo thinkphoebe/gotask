@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mathrand "math/rand"
 	"os"
 	"sort"
 	"strings"
@@ -440,8 +441,8 @@ func (self *TaskManager) updateTaskResource() {
 		}
 
 		for resType, succeed := range workerRes.ResourceDetails {
-			self.mutexResMap.Lock()
 			newResType := false
+			self.mutexResMap.Lock()
 			if _, ok := self.resTypesMap[resType]; !ok {
 				self.resTypesMap[resType] = time.Now().Unix()
 				newResType = true
@@ -466,24 +467,24 @@ func (self *TaskManager) updateTaskResource() {
 				opInfo, _ := self.etcd.OpPut(k, string(paramBytes), 0)
 
 				ifs := []clientv3.Op{*opInfo}
-				cmpParam := clientv3.Compare(clientv3.CreateRevision(k), "==", 0)
+				cmpParam := clientv3.Compare(clientv3.CreateRevision(k), "=", 0)
 				resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, nil)
 				if err != nil {
 					self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": workerRes.TaskId,
 						"error": "etcd.Txn got err:" + err.Error()})
 				} else if !resp.Succeeded {
-					self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": workerRes.TaskId,
-						"error": "etcd.Txn resp not Succeeded, should not go here"})
+					log.Infof("[%s] resp not succeed, task already in FailedResource [%s]", workerRes.TaskId, resType)
 				}
 			}
 
 			if workerRes.Succeed {
 				// 任务资源检测成功时扫描/FailedResource/{ResourceType}，更新各个资源检测失败任务的SucceedTaskCount
+				// ATTENTION 或许应跳过RetryCount > 0的任务，但需要读取ErrorInfo，考虑到此类任务数量影响都较小，暂时不做特别处理
 				callback := func(key string, val []byte) bool {
 					checkInfo := FailedResourceInfo{}
 					err := json.Unmarshal(val, &checkInfo)
-					if err == nil {
-						log.Errorf("FailedResource update, json.Unmarshal FAILED! k[%s], v[%s]", key, string(val))
+					if err != nil {
+                        log.Errorf("FailedResource update, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
 						return true
 					}
 					if workerRes.AddTime < checkInfo.AddTime {
@@ -514,8 +515,8 @@ func (self *TaskManager) updateTaskResource() {
 		callback := func(key string, val []byte) bool {
 			info := FailedResourceInfo{}
 			err := json.Unmarshal(val, &info)
-			if err == nil {
-				log.Errorf("callback, json.Unmarshal FAILED! k[%s], v[%s]", key, string(val))
+			if err != nil {
+                log.Errorf("callback, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
 				return true
 			}
 			tis = append(tis, &info)
@@ -524,8 +525,8 @@ func (self *TaskManager) updateTaskResource() {
 		self.etcd.WalkCallback(*self.config.Etcd.KeyPrefix+"/FailedResource/"+resType+"/",
 			callback, -1, 0, nil)
 
+		// 按照SucceedTaskCount从大到小排序，最多取MaxWaitResource个任务设置为WaitResource状态
 		sort.Sort(sort.Reverse(tis))
-
 		for i := 0; i < len(tis) && i < int(*self.config.MaxWaitResource); i++ {
 			ti := tis[i]
 			if ti.SucceedTaskCount > *self.config.WaitResourceThreshold {
@@ -547,14 +548,11 @@ func (self *TaskManager) updateTaskResource() {
 		}
 	}
 
-	ticker := time.NewTicker(time.Second * 300)
 	for {
-		select {
-		case <-ticker.C:
-			for resType := range self.resTypesMap {
-				checkWaitResource(resType)
-			}
+		for resType := range self.resTypesMap {
+			checkWaitResource(resType)
 		}
+		time.Sleep(time.Second * 300)
 	}
 }
 
@@ -695,14 +693,12 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 
 // 为了避免多线程同时修改任务信息，这里读取、修改、写入的步骤，写入时检测ModRevision，如果已经发生变化则不写入并重复以上步骤重新读取任务信息
 func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *TaskParam) bool) error {
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		key := self.itemKey(taskId, "TaskParam")
 		op := self.etcd.OpGet(key, false)
 		ctx, cancel := context.WithTimeout(context.TODO(), *self.config.Etcd.DialTimeout*time.Second)
 		respGet, err := self.etcd.Client.Do(ctx, *op)
-		if cancel != nil {
-			cancel()
-		}
+		cancel()
 		if err != nil || len(respGet.Get().Kvs) == 0 {
 			log.Errorf("[%s] Get TaskParam got err [%s][%v] or len(Kvs) == 0", taskId, key, err)
 			return errors.New("read TaskParam FAILED")
@@ -723,7 +719,7 @@ func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *Task
 		var paramBytes []byte
 		paramBytes, _ = json.Marshal(taskParam)
 		cmpParam := clientv3.Compare(clientv3.ModRevision(self.itemKey(taskId, "TaskParam")),
-			"==", respGet.Get().Kvs[0].ModRevision)
+			"=", respGet.Get().Kvs[0].ModRevision)
 		opTaskParam, _ := self.etcd.OpPut(self.itemKey(taskId, "TaskParam"), string(paramBytes), 0)
 		opProc, _ := self.etcd.OpPut(self.itemKey(taskId, "Processing"), string(paramBytes), 0)
 		// ATTENTION 修改任务会导致刷新Fetch key
@@ -736,7 +732,7 @@ func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *Task
 		}
 
 		ifs := []clientv3.Op{*opTaskParam, *opProc, *opFetch}
-		elses := []clientv3.Op{*opTaskParam}
+		elses := []clientv3.Op{}
 		resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, elses)
 		if err != nil {
 			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
@@ -826,6 +822,13 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 		return err
 	}
 
+	self.etcd.StartKeepalive(*config.Etcd.KeyPrefix+"/KeepAlive/Manager-"+config.InstanceId, 60, 5+mathrand.Intn(5),
+		func() {
+			self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed"})
+			self.etcd.Exit()
+			self.Exit()
+		})
+
 	self.config = *config
 	self.chTaskTypesUpdate = make(chan string, 100)
 	self.chFetchUpdate = make(chan _FetchInfo, 100)
@@ -834,28 +837,6 @@ func (self *TaskManager) Init(config *TaskManagerConfig) error {
 	self.resTypesMap = make(map[string]int64)
 	self.fetchCount = make(map[string]int64)
 	self.inited = true
-
-	// etcd使用中发现有watch收不到回调的情况，重启后恢复。怀疑和网络出问题后恢复有关。
-	// 这里做一个容错处理，manager定期写入etcd的一个key，超过10分钟写入失败，认为etcd有问题，退出重启。
-	// worker也watch此key，超时没有回调后认为etcd有问题，退出重启。
-	go func() {
-		failCount := 0
-		for {
-			key := *self.config.Etcd.KeyPrefix + "/KeepAlive"
-			if err := self.etcd.Put(key, time.Now().String(), 0); err != nil {
-				self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_keepalive", "fail_count": failCount, "err": err.Error()})
-				failCount += 1
-			} else {
-				failCount = 0
-			}
-			if failCount >= 10 {
-				self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "keepalive_failed"})
-				self.Exit()
-			}
-			time.Sleep(time.Second * 60)
-		}
-	}()
-
 	log.Infof("Init OK")
 	return nil
 }
