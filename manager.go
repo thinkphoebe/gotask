@@ -300,7 +300,7 @@ func (self *TaskManager) updateFetch() {
 		}
 		if !resp.Succeeded {
 			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
-				"error": "moveTask self.etcd.Txn not Succeeded"})
+				"error": "moveTask self.etcd.Txn not Succeeded, task may deleted"})
 			return
 		}
 
@@ -484,7 +484,7 @@ func (self *TaskManager) updateTaskResource() {
 					checkInfo := FailedResourceInfo{}
 					err := json.Unmarshal(val, &checkInfo)
 					if err != nil {
-                        log.Errorf("FailedResource update, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
+						log.Errorf("FailedResource update, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
 						return true
 					}
 					if workerRes.AddTime < checkInfo.AddTime {
@@ -516,7 +516,7 @@ func (self *TaskManager) updateTaskResource() {
 			info := FailedResourceInfo{}
 			err := json.Unmarshal(val, &info)
 			if err != nil {
-                log.Errorf("callback, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
+				log.Errorf("callback, json.Unmarshal FAILED! k[%s], v[%s], err:%v", key, string(val), err)
 				return true
 			}
 			tis = append(tis, &info)
@@ -677,6 +677,7 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 	for _, key := range keys {
 		self.etcd.Del(key, false)
 	}
+	self.etcd.Del(self.itemKey(taskId+"/", "WaitResource"), true)
 
 	// 出错删除时记录任务参数以便重做任务
 	param := "ommit"
@@ -732,8 +733,7 @@ func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *Task
 		}
 
 		ifs := []clientv3.Op{*opTaskParam, *opProc, *opFetch}
-		elses := []clientv3.Op{}
-		resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, elses)
+		resp, err := self.etcd.Txn([]clientv3.Cmp{cmpParam}, ifs, nil)
 		if err != nil {
 			self.config.CbLogJson(log.LevelError, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 				"error": "modifyTask self.etcd.Txn got err:" + err.Error()})
@@ -747,6 +747,7 @@ func (self *TaskManager) modifyTask(taskId string, cbModify func(taskParam *Task
 		}
 	}
 
+	log.Errorf("[%s] try too many times, abort", taskId)
 	return errors.New("try too many times")
 }
 
@@ -934,7 +935,6 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 			"error": "etcd.Txn got err:" + err.Error()})
 		return "", errors.New("etcd.Txn got err:" + err.Error())
 	}
-
 	if !resp.Succeeded {
 		self.config.CbLogJson(log.LevelCritical, log.Json{"cmd": "etcd_txn", "task_id": taskId,
 			"error": "etcd.Txn resp not Succeeded, should not go here"})

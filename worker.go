@@ -252,7 +252,7 @@ func (self *TaskWorker) checkNewTasks() {
 			res := self.resources[info.Name]
 			res.total = total
 			res.used = used
-			log.Debugf("[updateResource] [%s] total:%d, reserve:%d, used:%d",
+			log.Debugf("[updateResource][%s] total:%d, reserve:%d, used:%d",
 				info.Name, total, info.Reserve, used)
 		}
 	}
@@ -260,7 +260,7 @@ func (self *TaskWorker) checkNewTasks() {
 	doWaitResource := func(queue *_PriorityQueue, taskInfo *_TaskInfo) bool {
 		queue.mutex.Lock()
 		if queue.waitResource != nil {
-			log.Debugf("[WaitResource] [%s][%s] already have wait resource task [%s], skip wait",
+			log.Debugf("[WaitResource][%s][%s] already have wait resource task [%s], skip wait",
 				taskInfo.param.TaskId, taskInfo.param.TaskType, queue.waitResource.param.TaskId)
 			queue.mutex.Unlock()
 			return false
@@ -268,23 +268,28 @@ func (self *TaskWorker) checkNewTasks() {
 		queue.mutex.Unlock()
 
 		key := self.itemKey(taskInfo.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
-		cmp := clientv3.Compare(clientv3.CreateRevision(key), "!=", 0)
+		cmp := clientv3.Compare(clientv3.CreateRevision(key), "==", 0)
 		opPut, _ := self.etcd.OpPut(key, "", 0)
-		resp, err := self.etcd.Txn([]clientv3.Cmp{cmp}, []clientv3.Op{*opPut}, nil)
+		opGet := self.etcd.OpGet(key, false)
+		resp, err := self.etcd.Txn([]clientv3.Cmp{cmp}, []clientv3.Op{*opPut}, []clientv3.Op{*opGet})
+		var rev int64
 		if err != nil {
-			log.Errorf("[WaitResource] [%s] etcd.Txn got err:%v", taskInfo.param.TaskId, err)
-			return false
-		} else if !resp.Succeeded {
-			log.Errorf("[WaitResource] [%s] etcd.Txn response not succeed", taskInfo.param.TaskId)
-			self.etcd.Del(key, false)
+			log.Errorf("[WaitResource][%s] etcd.Txn got err:%v", taskInfo.param.TaskId, err)
 			return false
 		}
+		if resp.Succeeded {
+			rev = resp.Responses[0].GetResponsePut().Header.Revision
+			log.Debugf("[WaitResource][%s] create key [%s] succeed, revision:%d", key, rev)
+		} else {
+			rev = resp.Responses[0].GetResponseRange().Kvs[0].CreateRevision
+			log.Debugf("[WaitResource][%s] key [%s] already exists, revision:%d", key, rev)
+		}
 
-		getOpts := append(clientv3.WithLastCreate(), clientv3.WithMaxCreateRev(resp.Header.Revision-1))
+		getOpts := append(clientv3.WithLastCreate(), clientv3.WithMaxCreateRev(rev-1))
 		ctx, _ := context.WithTimeout(context.TODO(), *self.config.Etcd.DialTimeout*time.Second)
 		r, err := self.etcd.Client.Get(ctx, self.itemKey(taskInfo.param.TaskId, "WaitResource"), getOpts...)
 		if err == nil && len(r.Kvs) >= *self.config.MaxWaitResourceWorkers {
-			log.Infof("[WaitResource] [%s] already have %d waiting workers", taskInfo.param.TaskId, len(r.Kvs))
+			log.Infof("[WaitResource][%s] already have %d waiting workers", taskInfo.param.TaskId, len(r.Kvs))
 			self.etcd.Del(key, false)
 			return false
 		}
@@ -372,14 +377,14 @@ func (self *TaskWorker) checkNewTasks() {
 			log.Debugf("[checkResource][%s] resType [%s], sys total:%d, sys reserve:%d, sys used:%d, processing used:%d, queue need:%d, task need:%d",
 				taskInfo.param.TaskId, resType, sysRes.total, sysRes.reserve, sysRes.used, usedProc, usedQueue, resInfo.Need)
 			if usedProc+usedQueue+resInfo.Need > sysRes.total-sysRes.used-sysRes.reserve {
-				log.Debugf("[checkResource][%s] resource not enough, ret false", taskInfo.param.TaskId)
+				log.Debugf("[checkResource][%s] resource [%s] not enough", taskInfo.param.TaskId, resType)
 				succeed = false
 				checkInfo[resType] = false
 			} else {
 				checkInfo[resType] = true
 			}
 		}
-		log.Debugf("[checkResource][%s] all resource ok, return true", taskInfo.param.TaskId)
+		log.Debugf("[checkResource][%s] check completed, succeed:%v", taskInfo.param.TaskId, succeed)
 		return succeed, checkInfo
 	}
 
@@ -407,8 +412,14 @@ func (self *TaskWorker) checkNewTasks() {
 			succeed, checkInfo := checkResource(waitResource, priority, true)
 			if succeed {
 				log.Debugf("[%s] waitResourceTask have resource now, try to add", waitResource.param.TaskId)
+				// 成功后删除WaitResource、FailedResource信息
 				key := self.itemKey(waitResource.param.TaskId+"/"+self.config.InstanceId, "WaitResource")
 				self.etcd.Del(key, false)
+				for resType := range checkInfo {
+					key = *self.config.Etcd.KeyPrefix + "/FailedResource/" + resType + "/" + waitResource.param.TaskId
+					self.etcd.Del(key, false)
+				}
+
 				waitResource.cancelParamWatch()
 				waitResource.cancelParamWatch = nil
 				queue.mutex.Lock()
@@ -442,7 +453,7 @@ func (self *TaskWorker) checkNewTasks() {
 					writeResourceInfo(taskInfo, succeed, checkInfo)
 				}
 			} else {
-				log.Debugf("[%s] checkResource from first queue FAILED! wait resource:%p",
+				log.Debugf("[%s] checkResource from first queue FAILED! wait resource:%d",
 					taskInfo.param.TaskId, taskInfo.param.WaitResource)
 				if taskInfo.param.WaitResource != 0 {
 					doWaitResource(queue, taskInfo)
