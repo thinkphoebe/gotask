@@ -91,7 +91,7 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 		log.Debugf("[%s] no existing status", task.param.TaskId)
 	}
 	task.status.StartTime = time.Now().Unix()
-	self.updateStatusValue(task, TaskStatusInit, []byte(""))
+	self.updateStatusValue(task, TaskStatusInit, "init", []byte(""))
 
 	// 起一个goroutine监控任务的Owner key，被删掉时停止任务
 	on_delete := func(key string, val []byte) bool {
@@ -139,9 +139,10 @@ func (self *TaskWorker) tryAddTask(task *_TaskInfo) bool {
 	if err == nil {
 		log.Debugf("CbTaskStart ret Ok, set status to [%s]", TaskStatusInit)
 	} else {
+		reason := "CbTaskStart ret error:" + err.Error()
 		self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "remove_task", "task_id": task.param.TaskId,
-			"reason": "CbTaskStart ret error:" + err.Error(), "status": fmt.Sprintf("%#v", task.status)})
-		self.updateStatusValue(task, TaskStatusError, []byte(""))
+			"reason": reason, "status": fmt.Sprintf("%#v", task.status)})
+		self.updateStatusValue(task, TaskStatusError, reason, []byte(""))
 		self.removeTask(task)
 		return false
 	}
@@ -206,8 +207,9 @@ func (self *TaskWorker) checkNewTasks() {
 	}
 }
 
-func (self *TaskWorker) updateStatusValue(task *_TaskInfo, status string, userParam []byte) {
+func (self *TaskWorker) updateStatusValue(task *_TaskInfo, status, statusMsg string, userParam []byte) {
 	task.status.Status = status
+	task.status.StatusMsg = statusMsg
 	task.status.UserParam = userParam
 	task.status.UpdateTime = time.Now().Unix()
 	statusValue, _ := json.Marshal(task.status)
@@ -337,7 +339,7 @@ func (self *TaskWorker) Start(exitKeepAliveFail bool) {
 	log.Infof("Start OK")
 }
 
-func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userParam []byte) {
+func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status, statusMsg string, userParam []byte) {
 	self.mutex.Lock()
 	taskInfo, ok := self.taskProcessing[param.TaskId]
 	self.mutex.Unlock()
@@ -345,7 +347,7 @@ func (self *TaskWorker) UpdateTaskStatus(param *TaskParam, status string, userPa
 		log.Warnf("[%s][%s] task not found, status [%s]", param.TaskId, param.TaskType, status)
 		return
 	}
-	self.updateStatusValue(taskInfo, status, userParam)
+	self.updateStatusValue(taskInfo, status, statusMsg, userParam)
 	if status == TaskStatusComplete || status == TaskStatusError || status == TaskStatusRestart {
 		preTime := taskInfo.status.StartTime - param.AddTime
 		processingTime := time.Now().Unix() - taskInfo.status.StartTime

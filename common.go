@@ -24,6 +24,9 @@ type TaskManagerConfig struct {
 	FetchBatch   *int64     `json:"fetch_batch"`
 	FetchTimeout *int64     `json:"fetch_timeout"`
 
+	// 任务被删除时调用
+	CbTaskRemoved func(param *TaskParam, reason, status, status_message string) `json:"-"`
+
 	// TaskManager有重要json日志需要打印时调用此回调，用户可在回调中调用log.OutputJson()输出日志
 	CbLogJson func(level log.LogLevel, j log.Json) `json:"-"`
 }
@@ -73,6 +76,7 @@ type TaskParam struct {
 
 type TaskStatus struct {
 	Status     string `json:"status,omitempty"`
+	StatusMsg  string `json:"statusMsg,omitempty"`
 	StartTime  int64  `json:"startTime,omitempty"`
 	UpdateTime int64  `json:"updateTime,omitempty"`
 	UserParam  []byte `json:"userParam,omitempty"`
@@ -100,4 +104,10 @@ var (
 	TaskStatusWorking  = "working"
 	TaskStatusComplete = "complete"
 	TaskStatusRestart  = "restart" // 此状态的任务会立即重新分发，不受retryCount的限制。实时流退出时可使用此状态
+)
+
+var (
+	TaskRemoveComplete = "deleted_complete"
+	TaskRemoveError    = "deleted_error"
+	TaskRemoveUser     = "deleted_user"
 )

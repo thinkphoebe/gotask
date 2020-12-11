@@ -109,7 +109,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 	if err == nil && taskStatus.Status == TaskStatusComplete {
 		// 任务正常结束
 		log.Infof("[%s] remove complete task, status:%v, retryCount:%d", taskId, taskStatus, retryCount)
-		self.removeTask(taskId, "delete_complete")
+		self.removeTask(taskId, TaskRemoveComplete)
 	} else {
 		// err != nil的情况一般不应出现，仅在Worker进程创建了Owner但还未创建Status的瞬间挂掉的情况下可能出现
 		// 为避免任务被误删err != nil时添加了3次重试
@@ -142,7 +142,7 @@ func (self *TaskManager) onKeyOwnerDelete(key string, val []byte) bool {
 		} else {
 			// 删除出错任务
 			log.Infof("[%s] remove error task, status:%v, retryCount:%d", taskId, taskStatus, int(retryCount))
-			self.removeTask(taskId, "delete_error")
+			self.removeTask(taskId, TaskRemoveError)
 		}
 	}
 
@@ -445,7 +445,7 @@ func (self *TaskManager) recoverTask(taskId string, logId string, haveError bool
 	return true
 }
 
-func (self *TaskManager) removeTask(taskId string, logId string) error {
+func (self *TaskManager) removeTask(taskId string, reason string) error {
 	var taskParam TaskParam
 	var paramBytes []byte
 	if self.readEtcdJson(taskId, self.itemKey(taskId, "TaskParam"), &paramBytes, &taskParam) != nil {
@@ -496,14 +496,17 @@ func (self *TaskManager) removeTask(taskId string, logId string) error {
 
 	// 出错删除时记录任务参数以便重做任务
 	param := "ommit"
-	if logId == "delete_error" {
+	if reason == "delete_error" {
 		param = string(paramBytes)
 	}
 	preTime := taskStatus.StartTime - taskParam.AddTime
 	processingTime := time.Now().Unix() - taskStatus.StartTime
-	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": logId, "task_id": taskId, "user_id": taskParam.UserId,
+	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": reason, "task_id": taskId, "user_id": taskParam.UserId,
 		"task_type": taskParam.TaskType, "task_status": taskStatus, "task_param": param,
 		"pre_time": preTime, "processing_time": processingTime, "retry_count": errInfo.RetryCount})
+	if self.config.CbTaskRemoved != nil {
+		self.config.CbTaskRemoved(&taskParam, reason, taskStatus.Status, taskStatus.StatusMsg)
+	}
 	return nil
 }
 
@@ -720,7 +723,7 @@ func (self *TaskManager) Add(userId, taskType string, userParam []byte, retryCou
 }
 
 func (self *TaskManager) Remove(taskId string) error {
-	err := self.removeTask(taskId, "delete_user")
+	err := self.removeTask(taskId, TaskRemoveUser)
 	self.config.CbLogJson(log.LevelInfo, log.Json{"cmd": "task_remove", "task_id": taskId, "err": fmt.Sprintf("%v", err)})
 	return err
 }
